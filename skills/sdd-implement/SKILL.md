@@ -19,6 +19,52 @@ User runs: `/sdd-implement <spec-file-path>`
 
 Example: `/sdd-implement specs/security.constitution.yaml`
 
+## PHASE 0 — SPIKE CHECK (Pre-Lock Validation)
+
+### 0.1 Read spec for uncertainty markers
+Before extracting tasks, read the spec file's metadata and scan for `uncertainty` fields:
+- Check `spec.status` — is it `draft` or `locked`?
+- Scan for any section/entity/AC with `uncertainty: high`
+- Scan for any section/entity/AC with `uncertainty: medium`
+
+### 0.2 Gate based on findings
+
+**If spec status is `draft` (not `locked`):**
+```
+⚠️ SPEC NOT LOCKED
+This spec is in DRAFT status. Changes may drift during implementation.
+Uncertainties may surface as CHALLENGE verdicts from Guardian.
+Proceed anyway? [y/N]
+```
+
+**If any `uncertainty: high` sections exist:**
+```
+⚠️ UNRESOLVED UNCERTAINTIES — N items with uncertainty: high
+=============================================================
+[U-001] <area>: <rationale>
+[U-002] <area>: <rationale>
+
+These were not resolved before the spec was locked.
+Options:
+  [S] Run spike agent to resolve uncertainties before implementing
+  [P] Proceed with implementation (accept risk — may trigger CHALLENGEs)
+  [A] Abort — return to /sdd-spec-start to resolve uncertainties first
+```
+
+User chooses:
+- "S" or "spike" → spawn Spike agent, wait for findings, incorporate into spec before proceeding to Phase 1
+- "P" or "proceed" → document the risk: "⚠️ Proceeding with N unresolved uncertainties. Spec may change during implementation. Guardian may issue CHALLENGE verdicts."
+- "A" or "abort" → stop. Direct user to `/sdd-spec-start` to resolve uncertainties.
+
+**If any `uncertainty: medium` sections exist:**
+Warn non-blocking: "ℹ️ N sections have medium uncertainty. Low risk but may surface during implementation."
+
+### 0.3 If spec is a Spike Report (not a regular spec)
+If the user passes a Spike agent's output as the spec file, route differently:
+- Spike reports have findings, not tasks
+- Extract recommendations from the spike report
+- Feed them into spec update first, then proceed to Phase 1 with the updated spec
+
 ## PHASE 1 — EXTRACT TASKS
 
 ### 1.1 Read tasks from spec file (context for Maestro)
@@ -44,6 +90,19 @@ Agent(maestro, prompt="Read <spec-file-path>. The spec file has these pre-seeded
 Maestro returns the authoritative task board with phases, dependencies, and worker assignments.
 
 **If no `tasks:` section exists**, Maestro works from scratch — extracting tasks from violations, acceptance criteria, and gaps.
+
+### 1.2a Collect discovered opportunities
+After Maestro returns the task board, check the output for a `Discovered opportunities:` section.
+If present, extract and store separately from the task board:
+```
+DISCOVERED OPPORTUNITIES
+=========================
+[OPP-001] — <description>
+  Type: <improvement | refactor | performance | enhancement>
+  Context: <why Maestro noticed this>
+[OPP-002] — ...
+```
+These are NOT tasks. They will be presented to the user at Phase 5 (Review) for accept/deny/postpone decisions.
 
 ### 1.3 Present to user
 Display the task board. Ask user to confirm or adjust:
@@ -194,6 +253,60 @@ Do NOT attempt a 4th time. The loop stops for that task.
 
 **PARSE_ERROR →** re-spawn the worker with clearer instructions. Does NOT count as an attempt (worker output was unreadable, not wrong).
 
+**CHALLENGE verdict →** Guardian determined the SPEC is wrong or incomplete. This is NOT a rejection of the worker.
+
+### 3.5 CHALLENGE Resolution Loop
+
+When Guardian returns CHALLENGE:
+
+1. **Collect evidence.** Read Guardian's CHALLENGE output — challenge type, evidence files, spec text, code behavior, root cause.
+2. **Present to user.** Do NOT decide for the user. The AI cannot determine whether a CHALLENGE is valid — only the user can:
+   ```
+   CHALLENGE DETECTED — Task [X] "<description>"
+   =============================================
+   Guardian says: <challenge type + reason>
+   Challenge type: SPEC_FACTUALLY_WRONG | SPEC_INCOMPLETE
+   Evidence:
+     - <file:line> — <what it shows>
+     - <file:line> — <corroboration>
+   Spec requirement: "<exact spec text>"
+   Code behavior: "<what code does>"
+   Root cause: "<why the spec was wrong>"
+   
+   Resolution needed:
+     [A] Update spec — incorporate CHALLENGE evidence into spec
+     [B] Fix code — reject the CHALLENGE, make code match spec
+     [C] Clarify — the evidence or situation is unclear
+   ```
+3. **User decides:**
+   - "update spec" or "A" → proceed to CHALLENGE-driven spec update (Phase 3.5a)
+   - "fix code" or "B" → treat as REJECT, back to Phase 2
+   - "clarify" or "C" → ask user what they need clarified
+4. **Do NOT skip the user gate.** Guardian does not have authority to change specs. Only the user can confirm "the spec was wrong."
+
+### 3.5a CHALLENGE-Driven Spec Update
+
+When user chooses "update spec":
+1. Run `/sdd-spec-update "<description>"` with the CHALLENGE evidence as input.
+2. The anti-lazy guardrails in `/sdd-spec-update` enforce:
+   - User must approve the diff before write
+   - "Code already does this" is blocked as evidence
+   - Every change must reference the CHALLENGE evidence IDs
+3. After spec update, Guardian re-verifies the SAME worker output against UPDATED spec.
+4. If re-verify PASS → proceed to Phase 4. The task is DONE.
+5. If re-verify REJECT → spec change was insufficient OR code has other violations. Back to Phase 2 for remaining violations.
+6. If re-verify CHALLENGE on same rule → blocked. Mark rule as `challenge_resolved` in spec. Flag user: "Circular CHALLENGE on resolved rule. Manual intervention needed."
+
+**CRITICAL: Anti-Lazy Check at Phase 3.5a**
+Before running `/sdd-spec-update`, verify:
+- [ ] CHALLENGE evidence references concrete file paths with line numbers
+- [ ] Evidence is from external project constraints (config, deps, environment), NOT "code already does this"
+- [ ] Evidence traces to root cause, not a consequence
+- [ ] "Change spec to match code" does NOT appear in the resolution reasoning
+- [ ] At least 2 corroborating pieces of evidence from different files
+
+If any check fails → REJECT the CHALLENGE. Treat as REJECT — fix code to match spec.
+
 ## PHASE 4 — TEST
 
 ### 4.1 Prompt user
@@ -249,6 +362,33 @@ Files changed: <list>
 Branch: <branch-name> (local only, not pushed)
 ```
 
+### 5.1a Present Discovered Opportunities
+If any opportunities were collected during Phase 1 planning, present them BEFORE the final review:
+
+```
+DISCOVERED OPPORTUNITIES
+=========================
+During this implementation cycle, these improvements were noted:
+
+[OPP-001] — <description>
+  Type: <improvement | refactor | performance | enhancement>
+  Context: <why this came up>
+
+[OPP-002] — <description>
+  Type: ...
+  Context: ...
+
+For each opportunity, choose:
+  [A]ccept — add as a task to the spec for the next cycle
+  [D]eny — rejected, archived to learning store with reason
+  [P]ostpone — archived to learning store, revisit later
+```
+
+User response determines next steps:
+- "accept <id>" or "A <id>" → added to spec task board as new TODO task. Source: `"Phase 5 user review — accepted opportunity."`
+- "deny <id>" or "D <id>" → documented in learning store as `resolution: rejected`. Ask user for brief reason.
+- "postpone <id>" or "P <id>" → documented in learning store as `resolution: deferred`.
+
 ### 5.2 User review
 "Review the changes and approve."
 
@@ -267,8 +407,18 @@ Implementation is complete and verified. Now update the specs to match what was 
 1. Run `/sdd-spec-update "<description of changes made>"`
 2. This reconciles: spec tasks marked DONE/OBSOLETE, new tasks added for discovered work, spec sections updated to match code, versions bumped in individual spec files
 
+### 6.1a Anti-Lazy Gate (for CHALLENGE-driven updates only)
+When this Phase 6 update was triggered by a Phase 3 CHALLENGE:
+1. Verify CHALLENGE evidence passes the 6-point checklist from `/sdd-spec-update` anti-lazy guardrails
+2. Verify evidence traces to ROOT CAUSE, not a consequence:
+   - ROOT CAUSE: "Project has no PostgreSQL dependency (package.json audit)" — valid
+   - CONSEQUENCE: "Code already uses SQLite" — blocked (circular)
+3. Verify at least 2 pieces of corroborating evidence from different files
+4. If any check fails → REJECT the spec update. Treat the original CHALLENGE as REJECT — fix code to match spec.
+5. Only after ALL checks pass → proceed with spec update
+
 ### 6.2 Confirm spec update
-Spec update may flag spec-code drifts that need user decisions. Present these to the user. Once resolved, specs are now the authoritative source of truth for the CURRENT state.
+Spec update may flag spec-code drifts that need user decisions. Present these to the user. Once resolved, specs are now the Current Contract for the CURRENT state. If this was a CHALLENGE-driven update, Guardian must re-verify the worker output against the updated spec before proceeding.
 
 ### 6.3 HANDOFF update
 ```
@@ -369,6 +519,13 @@ Next: Request review. After merge, run `/sdd-git cleanup`.
 ### 9.4 Archive
 Task board marked ALL DONE. HANDOFF.md updated. Pipeline complete.
 
+### 9.5 Archive Opportunities to Learning Store
+If any opportunities were denied or postponed at Phase 5:
+1. Record them in the learning store (auto-captured by learning-capture hook on the spec file edit, or via `/sdd-learnings add`)
+2. Category: `discovery`. Resolution: `rejected` or `deferred`.
+3. Include the user's rationale for the decision
+4. This prevents opportunities from being forgotten AND from being re-raised without context in future sessions
+
 ## Key Rules (NEVER VIOLATE)
 
 ### Effort levels
@@ -384,7 +541,7 @@ Task fails Guardian 3 times (original + 2 fixes) → STOP, mark FAILED, flag use
 Failed tests = code wrong. Tests only change if tests themselves violate the spec. Tests must respect deployment's security layers — authenticate properly for auth-gated endpoints.
 
 ### Guardian is final
-No code is accepted without Guardian PASS. No exceptions. No "it's just a small change." No "the spec is probably outdated." Spec is Source of Truth.
+No code is accepted without Guardian PASS or user-resolved CHALLENGE. No exceptions. No "it's just a small change." No "the spec is probably outdated" without evidence. Spec is the Current Contract — it can be challenged with facts, but never ignored.
 
 ### Serialization discipline
 - Same file → NEVER parallel. Merge conflicts waste time.

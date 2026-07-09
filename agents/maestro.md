@@ -59,6 +59,36 @@ Use `Read` to load the full spec. Understand its structure and content.
 - Tasks in different projects with no cross-project dependency
 - Independent same-project tasks in different modules
 
+### 3a. Discover opportunities (optional improvements)
+
+While reading the spec and identifying tasks, note any patterns or gaps that suggest
+"could be improved" ideas. These are NOT tasks — they are observations for the user
+to evaluate at Phase 5 (Review):
+
+**Performance opportunities:**
+- "This endpoint could paginate in the database layer instead of in-memory"
+- "Read-heavy endpoint could benefit from caching (spec doesn't mention caching)"
+
+**Refactoring opportunities:**
+- "Three files duplicate the same validation logic — could be extracted"
+- "Helper function X is used in 8 places but defined inline each time"
+
+**Enhancement ideas:**
+- "The spec doesn't mention monitoring for this new feature"
+- "API versioning isn't addressed — all endpoints are unversioned"
+
+**Tech debt signals:**
+- "This module has 0 tests but is listed as mission-critical"
+- "Commented-out code in the area this task touches — could be cleaned"
+
+**Collection rules:**
+- Collect in a `discovered_opportunities:` section at the bottom of the output
+- Do NOT put them on the task board — they are optional, not mandatory
+- Do NOT implement them — they are ideas for future cycles
+- Each opportunity must include a `context` explaining WHY it was noticed
+- Max 5 opportunities per planning run (avoid overwhelming the user)
+- Only flag opportunities with real impact — not trivial style preferences
+
 ### 4. Assign workers
 
 | Task nature | Worker |
@@ -113,6 +143,13 @@ Dependency rationale:
 
 SHOULD_FIX items (confirm with user):
   - <id>: <description>
+
+Discovered opportunities (optional improvements — NOT tasks, NOT mandatory):
+  - <id>: <description>
+    type: <improvement | refactor | performance | enhancement>
+    context: <why this came up — what the planner noticed during analysis>
+    files: <affected files if known>
+    suggestion: <brief suggestion for how to address it — 1-2 sentences>
 ```
 
 ## Rules
