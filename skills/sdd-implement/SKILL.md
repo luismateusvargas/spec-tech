@@ -3,9 +3,10 @@ name: sdd-implement
 description: >
   SDD implementation pipeline. Reads a spec file, extracts actionable tasks
   (violations, acceptance criteria, gaps), and orchestrates the full cycle:
-  plan → delegate → verify → fix → test → review. Uses Maestro for planning,
-  cavecrew workers for implementation, and Guardian for spec-compliance
-  verification. Trigger: "/sdd-implement <spec-file-path>".
+  plan → branch → implement → verify → test → review → spec-update →
+  doc-sync → version → PR. Uses Maestro for planning, cavecrew workers for
+  implementation, Guardian for spec-compliance verification, Scribe for
+  documentation sync. Trigger: "/sdd-implement <spec-file-path>".
 ---
 
 # SDD Implementation Pipeline
@@ -68,6 +69,37 @@ Update this board after every action. This is your source of truth across the lo
 Spec tasks keep their original IDs for traceability. Maestro-discovered tasks get MAESTRO-NNN IDs.
 
 **When a spec task completes**, after Guardian PASS, update its `status` in the spec file from `TODO` to `DONE`. This keeps the spec file as the version-controlled source of truth for task progress.
+
+## PHASE 1.5 — GIT BRANCH (Local Only)
+
+### 1.5.1 Create feature branch
+After user approves the task board, create an isolated workspace:
+
+1. Derive branch name from the primary task:
+   ```
+   <type>/<task-id>-<short-slug>
+   ```
+   Examples: `feat/API-TASK-001-add-payment-webhook`, `fix/SEC-TASK-003-rate-limit-auth`
+
+2. Run: `git checkout -b <branch-name> main` (or `master` if main doesn't exist)
+
+3. **DO NOT push.** Branch stays local until Phase 9 (PR creation). Nothing is pushed before it's verified, spec'd, documented, and versioned.
+
+4. Record in HANDOFF.md:
+   ```
+   git:
+     branch: <branch-name>
+     base: main
+     created: <ISO timestamp>
+   ```
+
+### 1.5.2 Branch naming rules
+- Type prefix: `feat/`, `fix/`, `sec/`, `refactor/`, `docs/`, `chore/`
+- Task ID from the task board (e.g., `API-TASK-001`, `MAESTRO-001`)
+- Short slug: 4-5 words from task description, lowercase, hyphens, max 50 chars
+- If multiple tasks in the board, use the primary/highest-priority task
+
+**If no task ID is available** (Maestro hasn't assigned one yet), use a descriptive slug: `feat/<short-description>`.
 
 ## PHASE 2 — IMPLEMENT
 
@@ -214,6 +246,7 @@ Tasks completed: N
 Guardian approvals: N/N
 Tests passed: <test-count>
 Files changed: <list>
+Branch: <branch-name> (local only, not pushed)
 ```
 
 ### 5.2 User review
@@ -222,9 +255,118 @@ Files changed: <list>
 User manually tests, reviews code, verifies behavior.
 
 ### 5.3 User approves
-User says "approve" or "done" → run `/sdd-spec-update` to update specs as Source of Truth.
+User says "approve" or "done" → proceed to Phase 6.
 
-### 5.4 Archive
+**Note:** User approval gates the transition from implementation to finalization. Nothing is pushed yet. All git pushes happen in Phase 9.
+
+## PHASE 6 — SPEC UPDATE
+
+### 6.1 Reconcile specs with reality
+Implementation is complete and verified. Now update the specs to match what was actually built:
+
+1. Run `/sdd-spec-update "<description of changes made>"`
+2. This reconciles: spec tasks marked DONE/OBSOLETE, new tasks added for discovered work, spec sections updated to match code, versions bumped in individual spec files
+
+### 6.2 Confirm spec update
+Spec update may flag spec-code drifts that need user decisions. Present these to the user. Once resolved, specs are now the authoritative source of truth for the CURRENT state.
+
+### 6.3 HANDOFF update
+```
+Phase 6 complete: specs reconciled. <N> tasks marked DONE, <M> new tasks added. Next: Phase 7 (doc sync).
+```
+
+## PHASE 7 — DOC SYNC (Scribe)
+
+### 7.1 Sync documentation with updated specs
+Specs are now current (Phase 6). Sync documentation to match:
+
+```
+Agent(scribe, prompt="Pipeline sync. Affected spec domains: <list>. Changed files: <list>. Implemented tasks: <list>. Sync docs to match updated specs. Flag any residual code drift.", model="sonnet")
+```
+
+Scribe reads the UPDATED spec files and syncs documentation. It does NOT modify specs or code — only documentation files.
+
+### 7.2 Review Scribe output
+Present Scribe's sync report to user:
+- Drifts resolved
+- Gaps remaining
+- Files modified
+
+User confirms doc changes.
+
+### 7.3 HANDOFF update
+```
+Phase 7 complete: docs synced by Scribe. <N> drifts resolved. Next: Phase 8 (version bump).
+```
+
+## PHASE 8 — VERSION BUMP
+
+### 8.1 Coordinate versions across all files
+With specs updated and docs synced, bump versions consistently:
+
+1. Run `/sdd-version bump <major|minor|patch>` — auto-detect or user specifies
+2. This coordinates versions across: spec files, package.json/pyproject.toml, CHANGELOG.md
+3. Creates annotated git tag (user confirms, NOT auto-pushed)
+
+### 8.2 Confirm version changes
+Present version inventory to user:
+```
+VERSION CHANGES
+================
+specs/api-surface.spec.yaml:      1.2.3 → 1.3.0 (MINOR — new endpoint)
+specs/data-model.spec.yaml:       1.2.3 → 1.2.4 (PATCH — field constraint added)
+package.json:                     1.2.3 → 1.3.0 (aligned with primary spec)
+CHANGELOG.md:                     new entry for 1.3.0
+Git tag:                          v1.3.0 (local only)
+```
+
+### 8.3 HANDOFF update
+```
+Phase 8 complete: versions bumped to <new-version>. Changelog updated. Tag v<version> created locally. Next: Phase 9 (PR creation).
+```
+
+## PHASE 9 — PR CREATION
+
+### 9.1 Final readiness check
+All changes are committed, specs updated, docs synced, versions bumped. Verify:
+
+```
+PR READINESS CHECKLIST
+=======================
+[x] All changes committed
+[x] Guardian PASS on all tasks
+[x] Tests pass
+[x] Specs updated (Phase 6)
+[x] Docs synced (Phase 7)
+[x] Versions bumped (Phase 8)
+[ ] Ready to push and create PR
+```
+
+If any check fails → abort. Run the missing phase.
+
+### 9.2 Push and create PR
+This is the FIRST git push of the entire pipeline. Everything goes up together:
+
+1. `git push -u origin <branch-name>`
+2. `gh pr create --base main --head <branch-name> --title "<type>: <summary>" --body "<structured PR body with task IDs, spec refs, version changes>"`
+3. Return PR URL to user
+
+### 9.3 Pipeline complete
+```
+SDD PIPELINE COMPLETE
+======================
+PR: <url>
+Branch: <branch-name> → main
+Tasks: N/N completed
+Guardian: N/N PASS
+Tests: <count> passed
+Specs: updated (<version changes>)
+Docs: synced
+Version: <new-version>
+Next: Request review. After merge, run `/sdd-git cleanup`.
+```
+
+### 9.4 Archive
 Task board marked ALL DONE. HANDOFF.md updated. Pipeline complete.
 
 ## Key Rules (NEVER VIOLATE)
@@ -232,6 +374,7 @@ Task board marked ALL DONE. HANDOFF.md updated. Pipeline complete.
 ### Effort levels
 - Maestro: always spawn with `model: sonnet`
 - Guardian: always spawn with `model: sonnet`
+- Scribe: always spawn with `model: sonnet`
 - Cavecrew workers: spawn with `model: haiku` (fast, cheap, mechanical work)
 
 ### 2-strike rule
@@ -249,7 +392,23 @@ No code is accepted without Guardian PASS. No exceptions. No "it's just a small 
 - Different files, no shared state → parallelize aggressively.
 
 ### User gates
-User must approve: plan (Phase 1), sdd-spec-test invocation (Phase 4), final review (Phase 5). Do not skip these gates.
+User must approve: plan (Phase 1), sdd-spec-test invocation (Phase 4), final review (Phase 5), Scribe doc changes (Phase 7), version bump (Phase 8). Do not skip these gates.
+
+### Git discipline
+- Phase 1.5 creates feature branch LOCAL ONLY. Nothing is pushed.
+- Commits accumulate locally through Phases 2-8.
+- First git push happens in Phase 9 (PR creation).
+- NEVER push before Phase 9. NEVER push to main/master directly.
+- Branch naming: `<type>/<task-id>-<short-slug>`.
+- PR body MUST include task IDs, spec refs, and version changes.
+- Refer to `/sdd-git` for merge/rebase decisions.
+
+### Phase ordering (CRITICAL)
+Phases 6→7→8→9 MUST execute in order. Each depends on the previous:
+- Specs must be updated BEFORE docs (docs reference specs as source of truth)
+- Docs must be synced BEFORE version bump (changelog is a doc file)
+- Versions must be bumped BEFORE PR (PR includes version changes)
+- PR is LAST (all changes go into one PR together)
 
 ### Cavemem
 Every decision, verdict, and file change is auto-captured by cavemem PostToolUse hooks. Do not circumvent.
@@ -264,14 +423,17 @@ Phase N complete: <summary>. <X> tasks done, <Y> pending. Next: Phase N+1.
 If user says "stop", "cancel", or "abort":
 - Stop the current phase
 - Save task board state to HANDOFF.md
+- Branch stays local (nothing was pushed — no remote cleanup needed)
 - Deactivate sdd-implement skill
-- "Pipeline stopped at Phase N. Task board saved to HANDOFF.md. Resume with `/sdd-implement <spec-file>`."
+- "Pipeline stopped at Phase N. Task board saved to HANDOFF.md. Branch <name> is local only. Resume with `/sdd-implement <spec-file>`."
 
 ## Recovery
 
 If context is lost mid-pipeline:
-1. Read HANDOFF.md for last checkpoint
-2. Search cavemem for recent observations about the spec file
-3. Re-read the spec file
-4. Reconstruct task board from HANDOFF.md + cavemem
-5. Resume from the last completed phase
+1. Read HANDOFF.md for last checkpoint and branch name
+2. `git checkout <branch-name>` to resume work on the feature branch
+3. Search cavemem for recent observations about the spec file
+4. Re-read the spec file
+5. Reconstruct task board from HANDOFF.md + cavemem
+6. Resume from the last completed phase
+7. If branch doesn't exist (Phase 1.5 wasn't reached), create it now

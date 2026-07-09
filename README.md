@@ -12,12 +12,13 @@ A complete SDD (Spec-Driven Development) workflow system built on Claude Code CL
 
 | Component | Count | Purpose |
 |-----------|-------|---------|
-| Slash commands | 4 | `/sdd-spec-start`, `/sdd-spec-update`, `/sdd-spec-check`, `/sdd-spec-test` |
+| Slash commands | 6 | `/sdd-spec-start`, `/sdd-spec-update`, `/sdd-spec-check`, `/sdd-spec-test`, `/sdd-git`, `/sdd-version` |
 | Skills | 1 | `/sdd-implement` — full implementation pipeline |
-| Agents | 2 | maestro (planner), guardian (spec-compliance verifier) |
+| Agents | 3 | maestro (planner), guardian (spec-compliance verifier), scribe (documentation sync) |
 | Global hooks | 17 | Prompt enforcement, security blocks, handoff, cavemem |
 | Project hooks | 2 | File guard, project-level handoff |
 | Templates | 2 | Spec file template, security constitution baseline |
+| Reference docs | 2 | Versioning best practices, git workflow reference |
 | MCP servers | 2 | cavemem (memory), graphify/madar (codebase knowledge graph) |
 | CLAUDE.md | 2 | Global mandatory rules, project reference pattern |
 
@@ -32,13 +33,19 @@ spec-tech/
 │   ├── sdd-spec-start.md              #   Bootstrap specs for new project
 │   ├── sdd-spec-update.md             #   Update specs + reconcile tasks
 │   ├── sdd-spec-check.md              #   Brownfield audit (code→specs)
-│   └── sdd-spec-test.md               #   Adversarial test generation
+│   ├── sdd-spec-test.md               #   Adversarial test generation
+│   ├── sdd-git.md                     #   Git branch/PR workflow
+│   └── sdd-version.md                 #   Versioning control + tag management
 ├── skills/                            # Skills → ~/.claude/skills/
 │   └── sdd-implement/
 │       └── SKILL.md                   #   Implementation pipeline
 ├── agents/                            # Agent defs → ~/.claude/agents/
 │   ├── maestro.md                     #   Task decomposition planner
-│   └── guardian.md                    #   Spec-compliance verifier
+│   ├── guardian.md                    #   Spec-compliance verifier
+│   └── scribe.md                      #   Documentation sync agent
+├── docs/                              # Reference documentation
+│   ├── versioning-best-practices.md   #   Semver research + guidelines
+│   └── git-workflow-reference.md      #   Merge vs rebase, branch strategies
 ├── hooks/                             # Global hooks → ~/.claude/hooks/
 │   ├── block-attribution-commit.cjs   #   Block Co-Authored-By commits
 │   ├── block-security-violations.cjs  #   Block writes to .env/secrets
@@ -81,6 +88,7 @@ spec-tech/
 | Node.js | 20+ | `node --version` |
 | Python | 3.11+ | `python --version` (for graphify/madar) |
 | Git Bash | Any | Required on Windows for `$HOME` hook resolution |
+| GitHub CLI | Latest | `gh --version` (for `/sdd-git pr` and PR workflow) |
 | cavemem | Latest | `npm list -g cavemem` |
 | graphify-mcp-server | Latest | `pipx list \| grep graphify` |
 
@@ -541,18 +549,19 @@ Specs LOCKED                  Specs generated (draft)
          ▼
    /sdd-implement <spec-file>
          │
-         ├── Phase 1: Maestro extracts tasks (from spec tasks: section + analysis)
-         ├── Phase 2: Cavecrew workers implement tasks
-         ├── Phase 3: Guardian verifies spec compliance (PASS/REJECT)
-         ├── Phase 4: Tests run (code wrong, not tests)
-         └── Phase 5: Review → User approves
+         ├── Phase 1:   Maestro extracts tasks
+         ├── Phase 1.5: /sdd-git branch (local only, no push)
+         ├── Phase 2:   Cavecrew workers implement tasks
+         ├── Phase 3:   Guardian verifies spec compliance (PASS/REJECT)
+         ├── Phase 4:   Tests run (code wrong, not tests)
+         ├── Phase 5:   User review → approves
+         ├── Phase 6:   /sdd-spec-update (reconcile specs)
+         ├── Phase 7:   Scribe agent (sync docs with updated specs)
+         ├── Phase 8:   /sdd-version (coordinated bumps + changelog + tag)
+         └── Phase 9:   /sdd-git pr (push branch + create PR)
                │
                ▼
-         /sdd-spec-update
-           (reconcile specs, bump versions, update tasks)
-               │
-               ▼
-            LOOP
+         PR MERGED → LOOP
 ```
 
 ---
@@ -638,9 +647,9 @@ For cross-platform cavemem config, use:
 
 After deployment, verify each component:
 
-- [ ] **Commands:** `/sdd-spec-start`, `/sdd-spec-update`, `/sdd-spec-check`, `/sdd-spec-test` appear in help
+- [ ] **Commands:** `/sdd-spec-start`, `/sdd-spec-update`, `/sdd-spec-check`, `/sdd-spec-test`, `/sdd-git`, `/sdd-version` appear in help
 - [ ] **Skills:** `/sdd-implement` appears in help
-- [ ] **Agents:** `maestro` and `guardian` appear in available agent types
+- [ ] **Agents:** `maestro`, `guardian`, and `scribe` appear in available agent types
 - [ ] **Templates:** `~/.claude/commands/sdd-templates/` has both YAML files
 - [ ] **cavemem:** `mcp__cavemem__search` returns results
 - [ ] **madar:** `mcp__madar__graph_summary` returns repo overview (in a project with madar initialized)
@@ -669,6 +678,7 @@ When SDD components change:
 | New hook | `hooks/` + `settings/global-settings.json` + README hook reference |
 | New MCP server | `mcp/` + settings reference + README MCP section |
 | New agent type | `agents/` + README component table |
+| New reference doc | `docs/` + README directory structure |
 | Template changes | `templates/` |
 
 ---
@@ -681,9 +691,12 @@ When SDD components change:
 | sdd-spec-update | Existing spec files | Reconciling specs with code |
 | sdd-spec-check | security constitution, codebase | Auditing existing project |
 | sdd-spec-test | LOCKED specs, source code | Generating adversarial tests |
-| sdd-implement | maestro, guardian, spec tasks: | Full implementation pipeline |
+| sdd-implement | maestro, guardian, scribe, sdd-git, sdd-version | Full implementation pipeline |
+| sdd-git | gh CLI, spec task IDs | Branch/PR workflow |
+| sdd-version | sdd-spec-update, git | Coordinated version bumps + tags |
 | maestro | Spec file content | Task decomposition |
 | guardian | Spec file content, worker output | PASS/REJECT verification |
+| scribe | Updated specs, code, docs | Documentation sync |
 | cavemem | caveman plugin, Node.js | Cross-session memory |
 | madar/graphify | Python, graphify-mcp-server | Codebase knowledge graph |
 | All hooks | Node.js, Git Bash (Windows) | Lifecycle enforcement |
