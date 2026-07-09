@@ -44,18 +44,26 @@ For each affected domain spec:
    - Update security requirements (new attack surface from new features)
    - Update constraints
 4. **Version bumping (MANDATORY):**
-   - Read current `metadata.version` (semver format: `X.Y.Z-<status>`)
+   - Read current version from spec file (format: `X.Y.Z-<status>` where status is `draft|locked|implemented|stale`)
    - Bump according to change type:
-     - **MAJOR** (X+1.0.0): Breaking API changes, removed endpoints, schema migrations
-     - **MINOR** (X.Y+1.0): New features, new endpoints, new entities
-     - **PATCH** (X.Y.Z+1): Bug fixes, clarifications, typo corrections
+     - **MAJOR** (X+1.0.0): Breaking API changes, removed endpoints, schema migrations, changed auth requirements
+     - **MINOR** (X.Y+1.0): New features, new endpoints, new entities, deprecated (but not removed) endpoints
+     - **PATCH** (X.Y.Z+1): Bug fixes, clarifications, typo corrections, internal refactoring
+   - **Pre-release versions** (for draft/unstable specs):
+     - `X.Y.Z-alpha.N` — internal testing, feature-incomplete
+     - `X.Y.Z-beta.N` — external testing, feature-complete
+     - `X.Y.Z-rc.N` — release candidate, final testing
    - Update `metadata.updated: "<ISO timestamp>"`
    - Add changelog entry in a `# CHANGELOG` comment block near the metadata:
      ```yaml
      # CHANGELOG:
-     #   0.2.0 (2026-07-09): Added event-driven migration tasks, deprecated webhook
-     #   0.1.0 (2026-07-08): Initial locked spec from code analysis
+     #   1.3.0 (2026-07-09): Added payment webhook AC-012, deprecated legacy endpoint AC-001
+     #   1.2.0 (2026-07-05): Added Stripe integration entities
+     #   1.1.0 (2026-07-03): Added rate limiting constraints [SEC-TASK-003]
+     #   1.0.0 (2026-07-01): Initial locked spec from code analysis
      ```
+   - Changelog entries reference AC IDs (for feature changes) or task IDs (for fixes/enforcement)
+   - **Note:** Individual spec version bumps happen HERE. The COORDINATED project version bump (package.json, CHANGELOG.md, git tag) happens later via `/sdd-version` (sdd-implement Phase 8)
 5. If spec was `locked`, keep `locked` after update (the change IS the new locked state)
 6. **Task reconciliation (MANDATORY):**
    - Review existing `tasks:` section. For each task:
@@ -90,7 +98,10 @@ After updating individual specs:
 - **Always confirm deltas with user before rewriting specs.** Don't guess what's intentional.
 - **Never remove security rules.** Security only gets MORE restrictive.
 - **If security constitution baseline has updated since project creation, flag new rules for addition.**
-- **Track spec version history.** Write a changelog entry in the spec file.
+- **Track spec version history.** Write a changelog entry in the spec file. Changelog entries MUST reference AC IDs or task IDs.
+- **Spec version bumps are PER-SPEC.** Each spec gets its own bump based on its own changes.
+- **Coordinated project versioning is SEPARATE.** Package.json, CHANGELOG.md, and git tags are handled by `/sdd-version`, not by this command.
+- **Pre-release versions for unstable specs.** Use `-alpha.N`, `-beta.N`, `-rc.N` suffixes. Locked specs should NOT use pre-release versions (they are stable).
 
 ## Drift Detection Patterns
 Use these to identify spec-code mismatches:
@@ -125,9 +136,11 @@ After completion, report:
 - Unresolved drifts (user chose not to apply — explain why)
 - Cross-spec inconsistencies found and resolved
 - HANDOFF.md update summary
-- Version changes per spec (old version → new version, with bump rationale)
+- Version changes per spec (old version → new version, with bump rationale and pre-release flag if applicable)
 - Task changes per spec:
   - Tasks marked DONE: N
   - Tasks marked OBSOLETE: N
   - New tasks added: N (list IDs)
   - Tasks still TODO: N
+- Next actions:
+  - "Specs updated. Next in pipeline: Scribe syncs docs (Phase 7), then `/sdd-version bump` for coordinated project versioning (Phase 8)."

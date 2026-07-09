@@ -1,15 +1,28 @@
 # =============================================================================
-# SDD SPEC TEMPLATE — v1.0
+# SDD SPEC TEMPLATE — v1.1
 # =============================================================================
 # Copy this template for each domain spec file.
 # Required sections: spec, domain, acceptance_criteria, security, constraints
-# Optional sections: entities, dependencies, threat_model
+# Optional sections: entities, dependencies, threat_model, git
 
 spec:
   id: "<domain>-v1"           # e.g., "auth-v1", "payments-v1"
   status: draft               # draft | locked | implemented | stale
+  version: "1.0.0"            # Semver of this spec (independent from other specs)
   created: "YYYY-MM-DD"
   updated: "YYYY-MM-DD"
+
+  # Version policy — how this spec's version relates to other specs
+  version_policy:
+    sync_group: "<group>"     # api-surface | data-model | business-domain | security | deployment
+    depends_on: []            # List of sync_groups this spec's version depends on
+                              # e.g., api-surface depends_on: [data-model]
+                              #       business-domain depends_on: [data-model]
+                              #       deployment depends_on: [api-surface]
+                              #       security and data-model depend on nothing
+
+  # Changelog entries reference AC IDs (feature changes) or task IDs (fixes/enforcement)
+  # Format: version (date): <change summary> [AC-NNN] [TASK-ID]
   changelog:
     - version: "1.0.0"
       date: "YYYY-MM-DD"
@@ -91,6 +104,16 @@ dependencies:
   - domain: "<other domain>"
     relationship: "<how this domain uses the other>"
     criticality: CRITICAL | HIGH | MEDIUM
+
+# =============================================================================
+# GIT INTEGRATION — Track implementation history
+# =============================================================================
+# Populated by /sdd-git and sdd-implement pipeline. Not required for initial spec creation.
+git:
+  last_implementation_branch: ""    # Branch name from last /sdd-implement run
+  last_pr_url: ""                   # PR URL from last implementation cycle
+  last_pr_merged: ""                # Date PR was merged (YYYY-MM-DD)
+  last_version_tag: ""              # Git tag created for last release (vX.Y.Z)
 
 # =============================================================================
 # TASKS — Architectural decisions not yet implemented
