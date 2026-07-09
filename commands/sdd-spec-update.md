@@ -28,11 +28,13 @@ piece that solves the #1 SDD failure mode (specs going stale after shipping).
 For the affected domains:
 1. Read the current spec (what SHOULD be)
 2. Scan relevant source files (what IS)
-3. Identify deltas:
+3. If triggered by a CHALLENGE, load the CHALLENGE evidence and apply it first
+4. Identify deltas:
    - **Spec says X, code does Y** → spec drift. Flag as "DRIFT: spec outdated"
    - **Code does Z, spec never mentions Z** → undocumented feature. Flag as "DRIFT: undocumented"
    - **Spec says X, no code exists for X** → missing implementation. Flag as "MISSING: not implemented"
    - **Code does X, spec says X** → aligned. No action.
+   - **CHALLENGE: Spec says X, but facts say Y** → spec error. Apply CHALLENGE evidence. Flag as "CHALLENGE: spec wrong"
 
 ### Phase 3: Spec Rewrite
 For each affected domain spec:
@@ -96,12 +98,63 @@ After updating individual specs:
 ## Constraints
 - **NEVER write implementation code.** This command updates specs ONLY.
 - **Always confirm deltas with user before rewriting specs.** Don't guess what's intentional.
-- **Never remove security rules.** Security only gets MORE restrictive.
+- **Never remove security rules.** Security only gets MORE restrictive. If a security rule needs changing, record rationale in the decision log.
 - **If security constitution baseline has updated since project creation, flag new rules for addition.**
 - **Track spec version history.** Write a changelog entry in the spec file. Changelog entries MUST reference AC IDs or task IDs.
 - **Spec version bumps are PER-SPEC.** Each spec gets its own bump based on its own changes.
 - **Coordinated project versioning is SEPARATE.** Package.json, CHANGELOG.md, and git tags are handled by `/sdd-version`, not by this command.
 - **Pre-release versions for unstable specs.** Use `-alpha.N`, `-beta.N`, `-rc.N` suffixes. Locked specs should NOT use pre-release versions (they are stable).
+
+## Anti-Lazy Spec-Change Guardrails (MANDATORY)
+
+When a spec update is triggered by a Guardian CHALLENGE (spec was factually wrong or incomplete), these guardrails prevent the lazy pattern: "code did X, so update spec to say X."
+
+### 1. User Confirmation Required
+**Show the user the full diff of proposed spec changes before any write.**
+Do not write a single character until user says "approve" or equivalent.
+This applies to ALL spec updates, not just CHALLENGE-driven ones.
+
+### 2. "Change Spec to Match Code" Is FORBIDDEN
+```
+WRONG:   "Worker implemented SQLite, so update spec from PostgreSQL to SQLite."
+RIGHT:  "Project uses SQLite (evidence: package.json has sqlite3 as only DB driver,
+         alembic/env.py configured for sqlite dialect, no PostgreSQL dependency exists).
+         Spec was factually wrong about the database engine."
+```
+The justification must reference EXTERNAL facts — project configuration, dependency manifests, environment constraints, user-stated requirements. Never reference the worker's code output as the reason for the change.
+
+### 3. CHALLENGE Evidence Must Be Referenced
+Changelog entries from CHALLENGE-driven updates MUST include:
+```yaml
+# CHANGELOG:
+#   1.1.0 (2026-07-09): Updated DB requirement from PostgreSQL to SQLite
+#     Challenge: CHALLENGE-001 (SPEC_FACTUALLY_WRONG)
+#     Evidence files: package.json (sqlite3 dep), alembic/env.py (sqlite dialect)
+#     Root cause: Spec was generated from code analysis of a SQLite project but stated PostgreSQL
+```
+
+### 4. Guardian Re-Verify After Spec Change
+After the spec is updated from a CHALLENGE:
+1. Guardian must re-verify the SAME worker output against the UPDATED spec
+2. This confirms the code actually passes under the corrected spec
+3. If re-verify fails → spec change was insufficient or code has other violations
+4. This prevents the circular "spec changed so rejection goes away" pattern
+
+### 5. Evidence Requirement Checklist (6-Point Gate)
+Every CHALLENGE-driven spec change must pass ALL checks:
+- [ ] **File paths exist** — Evidence references real files (verify with Glob before accepting)
+- [ ] **Evidence is factual** — Not "this feels better" but "the project uses X because file Y shows Z"
+- [ ] **Evidence traces to root cause** — Not "because the code did it" but "because project constraint C requires it"
+- [ ] **Evidence is from EXTERNAL sources** — Project config, dependency manifests, environment, user-stated requirements. NOT worker output.
+- [ ] **Neutral-party test** — Would another engineer agree the spec was wrong based on this evidence?
+- [ ] **User has seen and approved** — No automated spec changes from CHALLENGE resolutions
+
+### 6. Blocked Resolution Patterns
+These resolution patterns are auto-rejected:
+- "Code implements X, so spec should say X" — circular, lazy
+- "It's simpler to change the spec than fix the code" — convenience, not correctness
+- "The spec was probably meant to say X" — guessing, not evidence
+- Any change without at least 2 pieces of corroborating evidence from different files
 
 ## Drift Detection Patterns
 Use these to identify spec-code mismatches:
@@ -142,5 +195,7 @@ After completion, report:
   - Tasks marked OBSOLETE: N
   - New tasks added: N (list IDs)
   - Tasks still TODO: N
+- Challenges resolved: N (list CHALLENGE IDs + resolution)
+- Anti-lazy gate: passed (all CHALLENGE-driven changes referenced external evidence)
 - Next actions:
-  - "Specs updated. Next in pipeline: Scribe syncs docs (Phase 7), then `/sdd-version bump` for coordinated project versioning (Phase 8)."
+  - "Specs updated. CHALLENGE-driven changes must be re-verified by Guardian. Then: Scribe syncs docs (Phase 7), then `/sdd-version bump` for coordinated project versioning (Phase 8)."

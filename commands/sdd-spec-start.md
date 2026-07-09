@@ -15,6 +15,53 @@ spec-before-code. No code is written until specs are LOCKED.
 
 ## Behavior
 
+### Phase 0: Uncertainty Detection (Pre-Lock Spike Check)
+
+Before locking any spec, scan for unresolved uncertainties and offer spike investigation.
+
+1. **Scan for high-uncertainty decisions.** As each domain spec is drafted in Phase 3, tag sections with `uncertainty: high` where:
+   - A technology choice has not been validated against project constraints
+   - A performance/scalability assumption has no evidence
+   - An integration path has not been tested
+   - A novel algorithm or approach is proposed without prototyping
+   - A third-party dependency has unknown compatibility
+
+2. **Document WHY it's uncertain.** Every `uncertainty: high` marker MUST include a `rationale` field:
+   ```yaml
+   uncertainty: high
+   rationale: "Unvalidated — spec assumes PostgreSQL but project pyproject.toml shows sqlite3. Need to confirm DB engine choice."
+   ```
+
+3. **Present to user.** After all domain specs are drafted but BEFORE locking:
+   ```
+   UNCERTAINTY REGISTER — N items need investigation before lock
+   ============================================================
+   [U-001] DB engine choice — uncertainty: high
+     Rationale: Spec says PostgreSQL, project has no pg dependency
+     Risk if untested: Wrong DB chosen → major rework during implementation
+   
+   [U-002] WebSocket scaling — uncertainty: high
+     Rationale: Spec requires 10K concurrent WS connections, unvalidated
+     Risk if untested: Architecture may not scale → production failure
+   
+   Run spike agent to investigate? [Y / skip <id> / proceed anyway]
+   ```
+
+4. **User decides per uncertainty:**
+   - "yes" or "Y" → spawn Spike agent for that uncertainty
+   - "skip <id>" → defer to implementation (document as `uncertainty: medium` with `rationale: "deferred by user"`)
+   - "proceed" → lock immediately, accept the risk (document in spec decisions section)
+
+5. **Spike agent returns → incorporate findings:**
+   - Update spec with resolved values
+   - Change `uncertainty: high` → `uncertainty: none` (or `low`)
+   - Add spike evidence to the spec's `decisions:` section
+   - If spike was BLOCKED → keep `uncertainty: high`, document the blocker
+
+6. **Only proceed to lock when:**
+   - All `uncertainty: high` items are RESOLVED (by spike or user decision), OR
+   - User explicitly accepts the risk of locking with unresolved uncertainties
+
 ### Phase 1: Environment Detection
 1. Scan project for existing files (package.json, pyproject.toml, go.mod, Cargo.toml, etc.)
 2. Detect language, framework, database, ORM
