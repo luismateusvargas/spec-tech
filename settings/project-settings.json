@@ -1,0 +1,51 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/madar-user-prompt-submit.cjs"
+          }
+        ],
+        "name": "madar",
+        "source": "madar"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "name": "file-guard",
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/pre-tool-guard.cjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "name": "cavemem-capture",
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"[NPM_GLOBAL]\\node_modules\\cavemem\\dist\\index.js\" hook run post-tool-use --ide claude-code 2>NUL || exit 0"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "name": "handoff-emergency",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/handoff-precompact.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
