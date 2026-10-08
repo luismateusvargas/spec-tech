@@ -1,0 +1,19 @@
+# Full YAML game project definition. Required fields appear below.
+# Use null + open_decisions + status: blocked for unanswered required fields.
+# Remove optional fields that do not apply; use repository-relative references.
+project:
+  id: null
+  status: blocked # draft | blocked | adopted
+  version: "0.1.0"
+  constitution_ref: null
+  player_experience: null
+  modes: null
+  engine: null # name and verified version
+  systems: null # [{name, responsibility, owner, path}]
+  content_pipeline: null # source assets, validation, build path
+  platforms: null # [{name, build_target, owner}]
+  release_checks: null # [{platform, check, expected_result}]
+  compatibility: null # save and content policy; explicit N/A where appropriate
+  domains: null # [{id, spec_ref}]; include only real bounded domains
+  evidence: []
+  open_decisions: []

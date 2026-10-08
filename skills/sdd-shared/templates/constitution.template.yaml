@@ -1,0 +1,25 @@
+# Full YAML constitution for SaaS or game projects.
+# Required: id, scope, rules, quality_gates, change_policy, project_ref.
+# Unanswered required value: null + open_decisions item + status: blocked.
+# Remove optional fields that do not apply; use repository-relative references.
+constitution:
+  id: null
+  status: blocked # draft | blocked | adopted
+  version: "0.1.0"
+  project_ref: null
+  scope: null
+  rules:
+    - id: null
+      statement: null
+      rationale: null
+      applies_to: null
+      verification: null
+  quality_gates:
+    - id: null
+      check: null
+      expected_result: null
+  change_policy:
+    approver: null
+    revision_process: null
+  evidence: [] # file, current primary URL, or user-confirmed decision reference with supported claim
+  open_decisions: [] # {field: constitution.scope, question: ..., owner: ...}

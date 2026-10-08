@@ -1,0 +1,20 @@
+# One YAML file per real game domain. Required fields appear below.
+# Use null + open_decisions + status: blocked for unanswered required fields.
+# Omit optional platform, content, save, and online details where inapplicable.
+domain:
+  id: null
+  status: blocked # draft | blocked | adopted
+  version: "0.1.0"
+  project_ref: null
+  constitution_ref: null
+  boundary: null
+  requirements:
+    - id: null
+      statement: null # one observable gameplay or system behavior
+      scenarios:
+        - given: null
+          when: null
+          then: null
+  dependencies: [] # {domain_ref, relationship}
+  evidence: []
+  open_decisions: []

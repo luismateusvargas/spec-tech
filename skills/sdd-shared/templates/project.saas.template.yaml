@@ -1,0 +1,19 @@
+# Full YAML SaaS project definition. Required fields appear below.
+# Use null + open_decisions + status: blocked for unanswered required fields.
+# Remove optional fields that do not apply; use repository-relative references.
+project:
+  id: null
+  status: blocked # draft | blocked | adopted
+  version: "0.1.0"
+  constitution_ref: null
+  purpose: null
+  users: null
+  services: null # [{name, responsibility, owner, path}]
+  environments: null # [{name, deploy_target, owner}]
+  identity: null # verified mechanism and authorization boundary
+  tenant_model: null # explicit single-tenant or isolation policy
+  data_stores: null # [{name, owner, data_scope}]
+  interfaces: null # [{name, kind, producer, consumers, contract_ref}]
+  domains: null # [{id, spec_ref}]; include only real bounded domains
+  evidence: []
+  open_decisions: []
