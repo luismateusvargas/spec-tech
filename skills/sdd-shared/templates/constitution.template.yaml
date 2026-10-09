@@ -1,5 +1,5 @@
 # Full YAML constitution for SaaS or game projects.
-# Required: id, scope, rules, quality_gates, change_policy, project_ref.
+# Required: id, scope, rules, logging, quality_gates, change_policy, project_ref.
 # Unanswered required value: null + open_decisions item + status: blocked.
 # Remove optional fields that do not apply; use repository-relative references.
 constitution:
@@ -14,6 +14,13 @@ constitution:
       rationale: null
       applies_to: null
       verification: null
+  logging:
+    info: null # normal significant events and outcomes; what context to record
+    warning: null # recoverable or unusual conditions needing attention
+    error: null # failed operations requiring investigation or action
+    debug: null # diagnostic detail, with when it may be enabled
+    safeguards: null # existing logger/configuration, sensitive-data rules, and noise limits
+    coverage_gaps: [] # verified code paths missing required logging; feed scoped plans
   quality_gates:
     - id: null
       check: null
