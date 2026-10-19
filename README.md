@@ -18,12 +18,25 @@ A portable, cross-agent spec-driven development (SDD) toolkit. It contains short
 
 The older `skills/sdd-implement/` and top-level `templates/` remain in the tree for existing users. New installations should use the twelve tiered skills and their `sdd-shared` sibling directory. The temporary `.reference-repos/` benchmark checkouts are development material, not part of the package.
 
+### Shared skills on this workstation
+
+The three local agents read the same `/home/htxzz77/Projects/skills/` directory through their global skill locations:
+
+| Client | Global skill path linked to the shared directory |
+| --- | --- |
+| Codex | `~/.agents/skills` |
+| Claude Code | `~/.claude/skills` |
+| Antigravity IDE / 2.0 | `~/.gemini/config/skills` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/skills` |
+
+Update the shared directory alongside this repository's `skills/` tree. The project installation steps below are for machines or client settings that do not use this shared directory. Local global skills do not automatically carry into cloud sessions.
+
 ## Set up a project
 
 1. Obtain this repository and choose the target project root.
 2. Install [Caipira](docs/caipira.md) on each machine that will use cross-agent memory. Install the coding clients first, then run Caipira's installer so it can register all of them.
 3. Copy the three root instruction files and `docs/coding/` into the target project, keeping the same relative layout. If the project already has an `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, merge the instructions instead of overwriting its own rules. The root files in this repository are ready to use when working on spec-tech itself.
-4. Install the active skills into the project skill locations shown below. Keep `sdd-shared/` beside the twelve skill folders because their relative links use it.
+4. If the clients do not use the shared global directory, install the active skills into the project skill locations shown below. Keep `sdd-shared/` beside the twelve skill folders because their relative links use it.
 5. Restart each client, check that the skills are listed, and confirm a focused Caipira search works in the target project.
 
 For macOS/Linux, this copies the skill suite to the two project locations used by the three clients. Set the paths to your actual checkout and target project before running it:
@@ -77,7 +90,7 @@ The coding guides in `docs/coding/` are defaults. Project configuration, support
 
 ## Maintain the package
 
-- Edit active skills in `skills/` and their shared files in `skills/sdd-shared/templates/`; install the changed directories again in projects that use copies.
+- Edit active skills in `skills/` and their shared files in `skills/sdd-shared/templates/`. For this checkout, copy each change to `/home/htxzz77/Projects/skills/` and verify the corresponding files match. Keep other contents of that shared folder intact, and install the changed directories again in projects that use separate copies.
 - Keep `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` short. Put language details in `docs/coding/` and workflow details in skills.
 - When project decisions change, update the project definition or task spec and record the settled decision in Caipira with file evidence.
 - Keep Caipira data outside Git. Do not commit local memory databases, model files, client settings, or temporary reference checkouts to this package.

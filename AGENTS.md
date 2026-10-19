@@ -6,3 +6,4 @@
 - Treat the guides as defaults. Explicit project rules, configured formatters and linters, supported language versions, and local patterns take precedence. Do not reformat unrelated code to satisfy a guide.
 - Verify changed behavior with the smallest meaningful tests and configured checks. Report what ran and any remaining limitations.
 - Keep secrets and generated artifacts out of changes unless the task explicitly requires them.
+- When changing this repository's active SDD skills or shared templates in `skills/`, also copy those changes to `/home/htxzz77/Projects/skills/` and verify the corresponding files match. This shared folder serves the separately configured agents; keep its other contents intact.
