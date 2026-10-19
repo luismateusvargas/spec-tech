@@ -15,6 +15,7 @@ Reconcile open questions from a linked plan only when they determine a durable p
 | Yes | What is the project for, who uses it, and what is outside its boundary? | `project.purpose`, `project.users` or `project.player_experience`; `constitution.scope` |
 | Yes | Which existing project rules must remain binding, and how are exceptions or revisions approved? | `constitution.rules`, `constitution.change_policy` |
 | Yes | Which build, test, and review checks gate acceptance? | `constitution.quality_gates` |
+| Yes | What logging already exists or is missing, and which events and safe context belong at INFO, WARNING, ERROR, and DEBUG? When may DEBUG be enabled? | `constitution.logging`; simple spec `Logging policy` |
 | Yes | Which domains or systems are in scope, and where are their existing definitions? | `project.domains` |
 | Optional | Which external standards or sources constrain a decision? | Relevant `evidence` or `rules` entry |
 
@@ -42,3 +43,7 @@ Reconcile open questions from a linked plan only when they determine a durable p
 ## Simple questions
 
 Ask the user for purpose, boundaries, and enduring rules. Confirm observed runtime, entry points, dependencies, permissions, data handling, and run/check commands. Ask optional security or compatibility questions only when the project touches them. Keep the answer in the simple Markdown project spec.
+
+## Logging level guidance
+
+Use the project's logger, level names, and configuration when they exist. Define INFO for meaningful normal lifecycle events and outcomes; WARNING for unusual or recoverable conditions that merit attention; ERROR for failed operations requiring investigation or action; DEBUG for detailed diagnostic state useful during troubleshooting. For each applicable level, name representative events and the safe context to include. Do not log every call or duplicate the same failure across layers. Keep secrets, credentials, personal data, and raw sensitive payloads out of logs; describe redaction and DEBUG enablement. Inspect current coverage and record gaps as scoped work for planning, not as claims that logging is already implemented. If the project has no runtime logging surface, state that explicitly with evidence instead of inventing events.

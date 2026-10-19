@@ -18,6 +18,10 @@
 
 <A few enduring project rules, or a link to an existing constitution>
 
+## Logging policy
+
+<Existing logger and coverage gaps; when and what to record at INFO, WARNING, ERROR, and DEBUG; diagnostic enablement and sensitive-data rules>
+
 ## Checks
 
 <How to run it; relevant test or manual scenarios>

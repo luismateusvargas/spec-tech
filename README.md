@@ -18,12 +18,25 @@ A portable, cross-agent spec-driven development (SDD) toolkit. It contains short
 
 The older `skills/sdd-implement/` and top-level `templates/` remain in the tree for existing users. New installations should use the twelve tiered skills and their `sdd-shared` sibling directory. The temporary `.reference-repos/` benchmark checkouts are development material, not part of the package.
 
+### Shared skills on this workstation
+
+The three local agents read the same `/home/htxzz77/Projects/skills/` directory through their global skill locations:
+
+| Client | Global skill path linked to the shared directory |
+| --- | --- |
+| Codex | `~/.agents/skills` |
+| Claude Code | `~/.claude/skills` |
+| Antigravity IDE / 2.0 | `~/.gemini/config/skills` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/skills` |
+
+Update the shared directory alongside this repository's `skills/` tree. The project installation steps below are for machines or client settings that do not use this shared directory. Local global skills do not automatically carry into cloud sessions.
+
 ## Set up a project
 
 1. Obtain this repository and choose the target project root.
 2. Install [Caipira](docs/caipira.md) on each machine that will use cross-agent memory. Install the coding clients first, then run Caipira's installer so it can register all of them.
 3. Copy the three root instruction files and `docs/coding/` into the target project, keeping the same relative layout. If the project already has an `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, merge the instructions instead of overwriting its own rules. The root files in this repository are ready to use when working on spec-tech itself.
-4. Install the active skills into the project skill locations shown below. Keep `sdd-shared/` beside the twelve skill folders because their relative links use it.
+4. If the clients do not use the shared global directory, install the active skills into the project skill locations shown below. Keep `sdd-shared/` beside the twelve skill folders because their relative links use it.
 5. Restart each client, check that the skills are listed, and confirm a focused Caipira search works in the target project.
 
 For macOS/Linux, this copies the skill suite to the two project locations used by the three clients. Set the paths to your actual checkout and target project before running it:
@@ -71,13 +84,13 @@ Choose one tier for the project, then use the relevant stage. A stage is a skill
 
 For example, in a SaaS project: “Use `sdd-orchestrate-saas` to establish the project, constitution, and domain definitions,” then “Use `sdd-plan-saas` to plan billing retries,” “Use `sdd-implement-saas` for that task spec,” and “Use `sdd-review-saas` to check the implementation.” Invoke a skill by name where the client supports it, or ask the agent to use that skill explicitly.
 
-The orchestrator asks only for unresolved durable decisions. It writes a simple Markdown project definition for small code, or YAML project, constitution, and relevant domain definitions for SaaS and games. Unknown required YAML fields remain explicit and block adoption. Planning creates **one task spec per bounded change**; implementation and review work from that spec. Caipira carries decisions and prior work between clients, so a separate session handoff file is unnecessary.
+The orchestrator asks only for unresolved durable decisions, including the project's logging policy. It writes a simple Markdown project definition for small code, or YAML project, constitution, and relevant domain definitions for SaaS and games. Unknown required YAML fields remain explicit and block adoption. Planning creates **one task spec per bounded change**, splitting broad requests into independently verifiable specs. Implementation makes local before and after commits for each spec; review writes a focused counter-plan when it confirms a failed criterion or regression, or creates a local approval tag when verification passes. The project owner handles pushes and releases. Caipira carries decisions and prior work between clients, so a separate session handoff file is unnecessary.
 
 The coding guides in `docs/coding/` are defaults. Project configuration, supported versions, local conventions, and the user's instructions take priority. Agents should read only the guide for code they touch. The security baseline is a reference to adapt and verify against current provider and framework behavior, not a blanket rule to paste into every project.
 
 ## Maintain the package
 
-- Edit active skills in `skills/` and their shared files in `skills/sdd-shared/templates/`; install the changed directories again in projects that use copies.
+- Edit active skills in `skills/` and their shared files in `skills/sdd-shared/templates/`. For this checkout, copy each change to `/home/htxzz77/Projects/skills/` and verify the corresponding files match. Keep other contents of that shared folder intact, and install the changed directories again in projects that use separate copies.
 - Keep `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` short. Put language details in `docs/coding/` and workflow details in skills.
 - When project decisions change, update the project definition or task spec and record the settled decision in Caipira with file evidence.
 - Keep Caipira data outside Git. Do not commit local memory databases, model files, client settings, or temporary reference checkouts to this package.
