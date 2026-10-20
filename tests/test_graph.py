@@ -13,24 +13,55 @@ from conftest import TARGET_FILE, generation_args
 from mcp.server.fastmcp.exceptions import ToolError
 
 from sdd_engine import mcp_server
-from sdd_engine.artifacts import ArtifactError
+from sdd_engine.artifacts import ArtifactError, WorkspaceRegistry
 from sdd_engine.errors import (
     ProfileError,
     RunNotFoundError,
     SpecContractError,
     WorkspaceMismatchError,
 )
+from sdd_engine.graph import (
+    EngineDependencies,
+    SddEngine,
+    _contract_retry_status,
+    check_contract_node,
+    hydrate_node,
+    rollback_node,
+    validate_node,
+)
+from sdd_engine.guidance import PromptHydrator
 from sdd_engine.limits import MAX_FILE_CHARS
-from sdd_engine.models import CommandResult, GraphInput, RunPhase, RunStatus, Target, Tier
+from sdd_engine.models import (
+    ArtifactRef,
+    CommandResult,
+    FailureReport,
+    GenerationOutput,
+    GraphInput,
+    GraphState,
+    OriginalFile,
+    RunPhase,
+    RunStatus,
+    Target,
+    Tier,
+    ValidationReport,
+)
 from sdd_engine.service import (
     begin_task,
+    cancel_task,
     configure_profile,
     finish_task,
     get_run_report,
     submit,
 )
 from sdd_engine.store import ProjectStore, project_database
-from sdd_engine.validation import CommandSpec, ValidationProfile, standard_commands
+from sdd_engine.validation import (
+    CommandSpec,
+    DockerCommandRunner,
+    NativeValidator,
+    ValidationInfrastructureError,
+    ValidationProfile,
+    standard_commands,
+)
 
 SPEC = "# Task\n\nStatus: ready\n\n## Outcome\n\nExpose VALUE = 1.\n"
 SPEC_PATH = "specs/task.md"
@@ -86,6 +117,8 @@ def test_begin_pauses_and_persists_prompt(project: Path) -> None:
     assert isinstance(prompt, dict)
     assert prompt["specification_text"] == SPEC
     assert prompt["allowed_target_files"] == [TARGET_FILE]
+    assert len(prompt["engineering_guidance"]) == 1
+    assert "untrusted workspace or command output" in prompt["untrusted_inputs_notice"]
     report = cast(dict[str, Any], get_run_report(str(project), str(result["run_id"])))
     assert report["model"] == "planned-model"
     assert report["phase"] == "pending"
@@ -119,6 +152,316 @@ def test_submit_validates_and_finish_records_declared_change(project: Path) -> N
         assert connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] > 0
 
 
+def test_submit_uses_frozen_prompt_without_rehydrating(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    original = PromptHydrator.hydrate
+
+    def counted(self: PromptHydrator, state: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(self, state)
+
+    monkeypatch.setattr(PromptHydrator, "hydrate", counted)
+    (project / "pkg").mkdir()
+    (project / TARGET_FILE).write_text("VALUE = 0\n", encoding="utf-8")
+    run_id = str(_begin(project)["run_id"])
+    assert calls == 1
+    (project / TARGET_FILE).write_text("VALUE = 2\n", encoding="utf-8")
+
+    result = cast(dict[str, Any], submit(str(project), run_id, generation_args()))
+
+    assert result["state"]["status"] == RunStatus.VALIDATED.value
+    assert calls == 1
+
+
+def test_prompt_artifact_allows_json_escape_expansion(project: Path) -> None:
+    (project / "pkg").mkdir()
+    content = "\n" * 700_000
+    (project / TARGET_FILE).write_text(content, encoding="utf-8")
+    (project / "pkg/other.py").write_text(content, encoding="utf-8")
+
+    result = cast(dict[str, Any], _begin(project, target_files=[TARGET_FILE, "pkg/other.py"]))
+
+    assert len(result["prompt"]["existing_files"]) == 2
+
+
+def test_repair_round_hydrates_once_after_failed_submission(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    original = PromptHydrator.hydrate
+
+    def counted(self: PromptHydrator, state: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(self, state)
+
+    monkeypatch.setattr(PromptHydrator, "hydrate", counted)
+    run_id = str(_begin(project)["run_id"])
+
+    result = cast(
+        dict[str, Any], submit(str(project), run_id, generation_args(documentation_metadata="bad"))
+    )
+
+    assert result["prompt"]["generation_feedback"] is not None
+    assert calls == 2
+    submit(str(project), run_id, generation_args())
+    assert calls == 2
+
+
+def test_cancel_pending_run_restores_edits_and_frees_workspace(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    (project / "rogue.py").write_text("x = 1\n", encoding="utf-8")
+
+    report = cast(dict[str, Any], cancel_task(str(project), run_id))
+
+    assert (report["phase"], report["outcome"]) == ("finished", "failed")
+    assert report["scope_report"]["restored"] is True
+    assert not (project / "rogue.py").exists()
+    assert "prompt" in _begin(project)
+
+
+def test_cancel_records_rollback_oserror_and_frees_workspace(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = str(_begin(project)["run_id"])
+    (project / "rogue.py").write_text("x = 1\n", encoding="utf-8")
+
+    def fail_restore(*args: object, **kwargs: object) -> None:
+        raise OSError("restore denied")
+
+    monkeypatch.setattr("sdd_engine.service.restore_tree", fail_restore)
+    report = cast(dict[str, Any], cancel_task(str(project), run_id))
+
+    assert (report["phase"], report["outcome"]) == ("finished", "failed")
+    assert report["scope_report"]["restored"] is False
+    assert "restore denied" in report["scope_report"]["rollback_error"]
+    assert "prompt" in _begin(project)
+
+
+def test_cancel_terminal_run_restores_generated_file(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    submit(str(project), run_id, generation_args())
+
+    report = cast(dict[str, Any], cancel_task(str(project), run_id))
+
+    assert (report["phase"], report["outcome"]) == ("finished", "failed")
+    assert not (project / TARGET_FILE).exists()
+    assert cancel_task(str(project), run_id) == report
+
+
+def test_submit_crash_finishes_and_restores_run(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = str(_begin(project)["run_id"])
+
+    def crash(self: object, *args: object, **kwargs: object) -> None:
+        destination = project / TARGET_FILE
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("partial\n", encoding="utf-8")
+        raise RuntimeError("unexpected graph failure")
+
+    monkeypatch.setattr("sdd_engine.graph.SddEngine.submit", crash)
+
+    with pytest.raises(RuntimeError, match="unexpected graph failure"):
+        submit(str(project), run_id, generation_args())
+
+    report = cast(dict[str, Any], get_run_report(str(project), run_id))
+    assert (report["phase"], report["outcome"]) == ("finished", "failed")
+    assert report["scope_report"]["restored"] is True
+    assert not (project / TARGET_FILE).exists()
+    assert "prompt" in _begin(project)
+
+
+def _node_fixture(project: Path) -> tuple[EngineDependencies, GraphState, ProjectStore]:
+    store = ProjectStore(project_database(project))
+    registry = WorkspaceRegistry({"node-run": project})
+    profile = store.get_profile(Target.PYTHON)
+    dependencies = EngineDependencies(
+        artifacts=store,
+        workspaces=registry,
+        prompts=PromptHydrator(Path(__file__).resolve().parents[1], store, registry),
+        validator=NativeValidator({Target.PYTHON: profile}, DockerCommandRunner()),
+    )
+    state = GraphState(
+        run_id="node-run",
+        workspace_id="node-run",
+        target=Target.PYTHON,
+        tier=Tier.SIMPLE,
+        specification=store.put(SPEC.encode(), "text/markdown"),
+        target_files=(TARGET_FILE,),
+    )
+    return dependencies, state, store
+
+
+def test_direct_hydrate_node_records_artifact_failure(project: Path) -> None:
+    dependencies, state, store = _node_fixture(project)
+    state = state.model_copy(
+        update={
+            "specification": ArtifactRef(digest="0" * 64, byte_length=1, media_type="text/markdown")
+        }
+    )
+
+    patch = hydrate_node(state, dependencies=dependencies)
+
+    assert patch["status"] == RunStatus.FAILED.value
+    failure = store.get_model(
+        ArtifactRef.model_validate(patch["failure_report"]), FailureReport, 8000
+    )
+    assert failure.category == "hydration"
+
+
+def test_direct_validate_node_handles_infrastructure_and_retry_limit(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependencies, state, store = _node_fixture(project)
+    generated = GenerationOutput.model_validate(generation_args())
+    state = state.model_copy(update={"generated_artifact": store.put_model(generated)})
+
+    def unavailable(target: Target, workspace: Path) -> ValidationReport:
+        raise ValidationInfrastructureError("runner unavailable")
+
+    monkeypatch.setattr(dependencies.validator, "validate", unavailable)
+    infrastructure = validate_node(state, dependencies=dependencies)
+    assert infrastructure["status"] == RunStatus.FAILED.value
+    failure = store.get_model(
+        ArtifactRef.model_validate(infrastructure["failure_report"]), FailureReport, 8000
+    )
+    assert failure.category == "validation_infrastructure"
+
+    def failed(target: Target, workspace: Path) -> ValidationReport:
+        return ValidationReport(
+            target=target,
+            passed=False,
+            commands=(CommandResult(command_name="check", exit_code=1),),
+            summary="native check failed",
+        )
+
+    monkeypatch.setattr(dependencies.validator, "validate", failed)
+    exhausted = validate_node(
+        state.model_copy(update={"validation_attempts": 2}), dependencies=dependencies
+    )
+    assert exhausted["status"] == RunStatus.FAILED.value
+    assert _contract_retry_status(dependencies, 9, 1) is RunStatus.FAILED
+    assert _contract_retry_status(dependencies, 2, 3) is RunStatus.FAILED
+
+
+def test_direct_contract_node_exhausts_generation_attempts(project: Path) -> None:
+    dependencies, state, store = _node_fixture(project)
+    generated = GenerationOutput.model_validate(
+        generation_args(files=[{"path": "other.py", "content": "VALUE = 1\n"}])
+    )
+    state = state.model_copy(
+        update={
+            "generated_artifact": store.put_model(generated),
+            "generation_attempts": 3,
+            "generation_failures": 2,
+        }
+    )
+
+    patch = check_contract_node(state, dependencies=dependencies)
+
+    assert patch["status"] == RunStatus.FAILED.value
+    assert patch["generation_failures"] == 3
+
+
+def test_graph_artifact_error_keeps_its_original_message(project: Path) -> None:
+    dependencies, state, _ = _node_fixture(project)
+
+    class BrokenGraph:
+        def invoke(self, value: object, config: object) -> None:
+            raise ArtifactError("stored prompt is corrupt")
+
+    engine = SddEngine(cast(Any, BrokenGraph()), dependencies)
+    request = GraphInput(
+        run_id=state.run_id,
+        workspace_id=state.workspace_id,
+        target=state.target,
+        tier=state.tier,
+        specification=state.specification,
+        target_files=state.target_files,
+    )
+
+    with pytest.raises(ArtifactError, match="stored prompt is corrupt"):
+        engine.begin(request)
+
+
+def test_direct_rollback_node_records_restore_failure(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependencies, state, store = _node_fixture(project)
+    state = state.model_copy(
+        update={
+            "status": RunStatus.FAILED,
+            "original_files": (
+                OriginalFile(path=TARGET_FILE, content=None, mode=None, created_directory=None),
+            ),
+        }
+    )
+
+    def fail_restore(*args: object, **kwargs: object) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(dependencies.workspaces, "restore", fail_restore)
+    patch = rollback_node(state, dependencies=dependencies)
+
+    assert patch["status"] == RunStatus.FAILED.value
+    failure = store.get_model(
+        ArtifactRef.model_validate(patch["failure_report"]), FailureReport, 8000
+    )
+    assert failure.category == "rollback"
+
+
+def test_diagnostics_are_loaded_before_large_existing_files(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dependencies, state, store = _node_fixture(project)
+    (project / "pkg").mkdir()
+    (project / TARGET_FILE).write_text("x" * 200, encoding="utf-8")
+    validation = store.put(b"validation detail", "text/plain")
+    generation = store.put(b"generation detail", "text/plain")
+    state = state.model_copy(
+        update={"validation_feedback": validation, "failure_report": generation}
+    )
+    hydrator = PromptHydrator(
+        Path(__file__).resolve().parents[1],
+        store,
+        dependencies.workspaces,
+        max_context_bytes=140,
+    )
+    monkeypatch.setattr(hydrator, "_load_skill", lambda name: "")
+    calls: list[str] = []
+    original_get_text = store.get_text
+    original_read_text = dependencies.workspaces.read_text
+
+    def get_text(reference: ArtifactRef, max_bytes: int) -> str:
+        calls.append(reference.digest)
+        return original_get_text(reference, max_bytes)
+
+    def read_text(workspace_id: str, path: str, max_bytes: int) -> str | None:
+        calls.append(path)
+        return original_read_text(workspace_id, path, max_bytes)
+
+    monkeypatch.setattr(store, "get_text", get_text)
+    monkeypatch.setattr(dependencies.workspaces, "read_text", read_text)
+
+    with pytest.raises(ArtifactError, match="hydration limit"):
+        hydrator.hydrate(state)
+
+    assert calls.index(validation.digest) < calls.index(TARGET_FILE)
+    assert calls.index(generation.digest) < calls.index(TARGET_FILE)
+
+
+def test_missing_skill_is_an_artifact_error(project: Path) -> None:
+    dependencies, _, store = _node_fixture(project)
+    hydrator = PromptHydrator(project, store, dependencies.workspaces)
+
+    with pytest.raises(ArtifactError, match="could not load skill"):
+        hydrator._load_skill("unknown-engineering-skill")
+
+
 def test_bad_submission_retries_with_contract_feedback(project: Path) -> None:
     run_id = str(_begin(project)["run_id"])
     first = cast(
@@ -146,7 +489,8 @@ def test_failed_run_restores_agent_edits(project: Path, monkeypatch: pytest.Monk
     report = cast(dict[str, Any], finish_task(str(project), run_id))
     assert report["scope_report"]["restored"] is True
     assert report["scope_report"]["changes"] == [
-        {"path": "rogue.py", "label": "undeclared", "flags": ["suppression_added"]}
+        {"path": TARGET_FILE, "label": "declared", "flags": []},
+        {"path": "rogue.py", "label": "undeclared", "flags": ["suppression_added"]},
     ]
     assert not (project / "rogue.py").exists()
     assert not (project / TARGET_FILE).exists()
@@ -223,6 +567,8 @@ def test_run_rejects_access_from_sibling_worktree(project: Path) -> None:
         submit(str(sibling), run_id, generation_args())
     with pytest.raises(WorkspaceMismatchError, match="belongs to worktree"):
         finish_task(str(sibling), run_id)
+    with pytest.raises(WorkspaceMismatchError, match="belongs to worktree"):
+        cancel_task(str(sibling), run_id)
 
     record = ProjectStore(project_database(project)).run(run_id)
     assert record.phase is RunPhase.PENDING
@@ -276,6 +622,7 @@ def test_configure_profile_uses_standard_commands_when_omitted(project: Path) ->
 
     actual = ProjectStore(project_database(project)).get_profile(Target.PYTHON)
     assert actual.commands == standard_commands(Target.PYTHON, project)
+    assert actual.timeout_seconds == 120
 
 
 @pytest.mark.parametrize("version", [1, 2])
@@ -519,6 +866,7 @@ def _schema_definition(schema: dict[str, Any], name: str) -> dict[str, Any]:
 
 def test_mcp_tools_publish_typed_schemas() -> None:
     tools = {tool.name: tool for tool in asyncio.run(mcp_server.implementer.list_tools())}
+    assert "cancel_task" in tools
     begin_schema = tools["begin_task"].inputSchema
     submit_schema = tools["submit"].inputSchema
 

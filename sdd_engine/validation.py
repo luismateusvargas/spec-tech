@@ -101,7 +101,7 @@ class ValidationProfile(StrictModel):
 
     image: ImageRef
     commands: JsonTuple[CommandSpec]
-    timeout_seconds: int = Field(default=600, ge=1, le=3600)
+    timeout_seconds: int = Field(default=120, ge=1, le=3600)
     memory_limit: MemoryLimit = "4g"
     cpu_limit: float = Field(default=2.0, gt=0, le=64)
     process_limit: int = Field(default=256, ge=16, le=8192)

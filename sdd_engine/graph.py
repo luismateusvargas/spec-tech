@@ -1,10 +1,12 @@
-"""Hierarchical LangGraph router with strict node contracts and repair loops."""
+"""Single LangGraph workflow with bounded submission and validation repair loops."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any, cast
+from functools import partial
+from typing import Any, Literal, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -24,6 +26,7 @@ from sdd_engine.limits import (
     MAX_DIAGNOSTIC_CHARS,
     MAX_GENERATED_ARTIFACT_BYTES,
     MAX_ORIGINAL_FILE_BYTES,
+    MAX_PROMPT_ARTIFACT_BYTES,
 )
 from sdd_engine.models import (
     ArtifactRef,
@@ -34,7 +37,6 @@ from sdd_engine.models import (
     GraphPatch,
     GraphState,
     OriginalFile,
-    RouteDecision,
     RunStatus,
     Target,
     Tier,
@@ -52,6 +54,7 @@ CHECKPOINT_TYPES: tuple[type, ...] = (
     Target,
     Tier,
 )
+CHECKPOINT_ALLOWLIST = [(kind.__module__, kind.__name__) for kind in CHECKPOINT_TYPES]
 
 
 def checkpoint_serializer() -> JsonPlusSerializer:
@@ -59,14 +62,12 @@ def checkpoint_serializer() -> JsonPlusSerializer:
 
     Pass it as the `serde` of a checkpointer given to `build_engine`.
     """
-    return JsonPlusSerializer(
-        allowed_msgpack_modules=[(kind.__module__, kind.__name__) for kind in CHECKPOINT_TYPES]
-    )
+    return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_ALLOWLIST)
 
 
 @dataclass(frozen=True)
 class EngineDependencies:
-    """Infrastructure dependencies shared by language-specialist subgraphs."""
+    """Infrastructure and retry limits shared by graph nodes."""
 
     artifacts: ArtifactStore
     workspaces: WorkspaceRegistry
@@ -74,6 +75,7 @@ class EngineDependencies:
     validator: NativeValidator
     max_generation_attempts: int = 3
     max_validation_attempts: int = 3
+    max_total_submissions: int = 9
 
     def __post_init__(self) -> None:
         """Reject retry configurations that can create unbounded graph loops."""
@@ -81,29 +83,46 @@ class EngineDependencies:
             raise ValueError("max_generation_attempts must be between 1 and 10")
         if not 1 <= self.max_validation_attempts <= 10:
             raise ValueError("max_validation_attempts must be between 1 and 10")
+        if not 1 <= self.max_total_submissions <= 100:
+            raise ValueError("max_total_submissions must be between 1 and 100")
+
+    @property
+    def max_submissions_per_round(self) -> int:
+        """Name the contract retry budget for one validation round."""
+        return self.max_generation_attempts
+
+    @property
+    def max_repair_rounds(self) -> int:
+        """Name the number of native validation attempts."""
+        return self.max_validation_attempts
 
 
 def build_graph(
     dependencies: EngineDependencies,
     checkpointer: BaseCheckpointSaver[str] | None = None,
 ) -> CompiledStateGraph[GraphState, None, GraphState, GraphState]:
-    """Compile a router graph whose target-specific subgraphs share strict wrappers."""
-    outer: StateGraph[GraphState, None, GraphState, GraphState] = StateGraph(GraphState)
-    target_routes: dict[Hashable, str] = {}
-
-    for target in Target:
-        route = _route_name(target)
-        outer.add_node(route, _build_specialist_subgraph(target, dependencies))
-        target_routes[route] = route
-        outer.add_edge(route, END)
-
-    outer.add_conditional_edges(START, _route_target, target_routes)
+    """Compile one target-independent graph with a separate hydration checkpoint."""
+    graph: StateGraph[GraphState, None, GraphState, GraphState] = StateGraph(GraphState)
+    for name, node in (
+        ("hydrate", hydrate_node),
+        ("await_submission", await_submission_node),
+        ("check_contract", check_contract_node),
+        ("apply_files", apply_files_node),
+        ("validate", validate_node),
+        ("rollback", rollback_node),
+    ):
+        _add_strict_node(graph, name, partial(node, dependencies=dependencies))
+    graph.add_edge(START, "hydrate")
+    graph.add_conditional_edges("hydrate", _route_after_hydration)
+    graph.add_conditional_edges("await_submission", _route_after_submission)
+    graph.add_conditional_edges("check_contract", _route_after_contract)
+    graph.add_conditional_edges("apply_files", _route_after_application)
+    graph.add_conditional_edges("validate", _route_after_validation)
+    graph.add_edge("rollback", END)
     if checkpointer is not None:
         # Extends an explicit or strict-mode allowlist; a permissive serializer is unchanged.
-        checkpointer = checkpointer.with_allowlist(
-            [(kind.__module__, kind.__name__) for kind in CHECKPOINT_TYPES]
-        )
-    return outer.compile(checkpointer=checkpointer)
+        checkpointer = checkpointer.with_allowlist(CHECKPOINT_ALLOWLIST)
+    return graph.compile(checkpointer=checkpointer)
 
 
 def build_engine(
@@ -132,24 +151,32 @@ class SddEngine:
         initial_state = GraphState.model_validate(validated_request.model_dump())
         return self._step(initial_state, validated_request.workspace_id, validated_request.run_id)
 
-    def submit(self, run_id: str, workspace_id: str, response: object) -> dict[str, object]:
+    def submit(
+        self, run_id: str, workspace_id: str, response: object, *, workspace_locked: bool = False
+    ) -> dict[str, object]:
         """Resume a paused run with the implementer's structured file submission."""
-        return self._step(Command(resume=response), workspace_id, run_id)
+        return self._step(Command(resume=response), workspace_id, run_id, workspace_locked)
 
     def _step(
-        self, value: GraphState | Command[Any], workspace_id: str, run_id: str
+        self,
+        value: GraphState | Command[Any],
+        workspace_id: str,
+        run_id: str,
+        workspace_locked: bool = False,
     ) -> dict[str, object]:
         """Advance the graph under a worktree lock and expose only prompt or state."""
-        try:
-            with self._dependencies.workspaces.lock(workspace_id):
-                result = self._graph.invoke(
-                    value,
-                    config={"configurable": {"thread_id": run_id}},
-                )
-        except WorkspaceBusyError as error:
-            raise ArtifactError("another run is using this workspace") from error
-        except ArtifactError as error:
-            raise ArtifactError("the workspace could not be locked") from error
+        with ExitStack() as stack:
+            if not workspace_locked:
+                try:
+                    stack.enter_context(self._dependencies.workspaces.lock(workspace_id))
+                except WorkspaceBusyError:
+                    raise
+                except ArtifactError as error:
+                    raise ArtifactError("the workspace could not be locked") from error
+            result = self._graph.invoke(
+                value,
+                config={"configurable": {"thread_id": run_id}},
+            )
         if "__interrupt__" in result:
             values = result["__interrupt__"]
             return {
@@ -158,252 +185,364 @@ class SddEngine:
         return {"state": GraphState.model_validate(result).model_dump(mode="json")}
 
 
-def _build_specialist_subgraph(
-    target: Target, dependencies: EngineDependencies
-) -> CompiledStateGraph[GraphState, None, GraphState, GraphState]:
-    """Build an isolated generate/validate loop for one selected stack target."""
-    specialist: StateGraph[GraphState, None, GraphState, GraphState] = StateGraph(GraphState)
-
-    def record_failure(category: str, summary: str, error: Exception | None = None) -> ArtifactRef:
-        failure = FailureReport(
+def _record_failure(
+    dependencies: EngineDependencies, category: str, summary: str, error: Exception | None = None
+) -> ArtifactRef:
+    """Store bounded failure detail outside checkpoint state."""
+    return dependencies.artifacts.put_model(
+        FailureReport(
             category=category,
             summary=summary,
             diagnostics="" if error is None else str(error)[:MAX_DIAGNOSTIC_CHARS],
         )
-        return dependencies.artifacts.put_model(failure)
+    )
 
-    def snapshot_original(workspace_id: str, path: str) -> OriginalFile:
-        snapshot = dependencies.workspaces.snapshot(workspace_id, path, MAX_ORIGINAL_FILE_BYTES)
-        content = (
-            None
-            if snapshot.content is None
-            else dependencies.artifacts.put(snapshot.content, "application/octet-stream")
+
+def _snapshot_original(
+    dependencies: EngineDependencies, workspace_id: str, path: str
+) -> OriginalFile:
+    """Store a file's pre-write bytes before changing it."""
+    snapshot = dependencies.workspaces.snapshot(workspace_id, path, MAX_ORIGINAL_FILE_BYTES)
+    content = (
+        None
+        if snapshot.content is None
+        else dependencies.artifacts.put(snapshot.content, "application/octet-stream")
+    )
+    return OriginalFile(
+        path=path,
+        content=content,
+        mode=snapshot.mode,
+        created_directory=snapshot.created_directory,
+    )
+
+
+def hydrate_node(raw_state: GraphState, *, dependencies: EngineDependencies) -> dict[str, object]:
+    """Store the complete prompt before the interrupting node starts."""
+    state = _validate_state(raw_state)
+    try:
+        prompt_ref = dependencies.artifacts.put_model(dependencies.prompts.hydrate(state))
+    except ArtifactError as error:
+        failure_ref = _record_failure(
+            dependencies,
+            "hydration",
+            "Generation inputs could not be loaded within their limits.",
+            error,
         )
-        return OriginalFile(
-            path=path,
-            content=content,
-            mode=snapshot.mode,
-            created_directory=snapshot.created_directory,
+        return _validated_patch(
+            state,
+            GraphPatch(prompt_artifact=None, failure_report=failure_ref, status=RunStatus.FAILED),
         )
+    return _validated_patch(state, GraphPatch(prompt_artifact=prompt_ref))
 
-    def rollback(raw_state: GraphState) -> dict[str, Any]:
-        state = _validate_state(raw_state)
-        try:
-            # Restore in reverse so a later file's directories are removed before earlier ones.
-            for original in reversed(state.original_files):
-                content = (
-                    None
-                    if original.content is None
-                    else dependencies.artifacts.get(original.content, MAX_ORIGINAL_FILE_BYTES)
-                )
-                dependencies.workspaces.restore(
-                    state.workspace_id,
-                    original.path,
-                    content,
-                    original.mode,
-                    original.created_directory,
-                )
-        except (ArtifactError, OSError) as error:
-            cause = (
-                "unknown"
-                if state.failure_report is None
-                else f"failure report {state.failure_report.digest}"
-            )
-            failure_ref = record_failure(
-                "rollback",
-                "The run failed and its workspace changes could not be fully restored.",
-                RuntimeError(f"{error}\n\nOriginal failure: {cause}"),
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-        return _validated_patch(state, GraphPatch(workspace_restored=True))
 
-    def generate(raw_state: GraphState) -> dict[str, Any]:
-        state = _validate_state(raw_state)
-        try:
-            prompt = dependencies.prompts.hydrate(state)
-        except ArtifactError as error:
-            # Missing or oversized inputs do not change between attempts, so do not retry.
-            failure_ref = record_failure(
-                "hydration", "Generation inputs could not be loaded within their limits.", error
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-
-        attempt = state.generation_attempts + 1
-        # Each generation round, the first or a repair after failed checks, has its own budget.
+def await_submission_node(
+    raw_state: GraphState, *, dependencies: EngineDependencies
+) -> dict[str, object]:
+    """Interrupt with a frozen prompt and validate the resumed payload."""
+    state = _validate_state(raw_state)
+    if state.prompt_artifact is None:
+        failure_ref = _record_failure(
+            dependencies, "missing_prompt", "Submission cannot proceed without a hydrated prompt."
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    prompt = dependencies.artifacts.get_model(
+        state.prompt_artifact, GenerationPrompt, MAX_PROMPT_ARTIFACT_BYTES
+    )
+    submitted = interrupt(prompt.model_dump(mode="json"))
+    attempt = state.generation_attempts + 1
+    try:
+        generated = GenerationOutput.model_validate(submitted)
+    except (ValidationError, ValueError) as error:
         failures = state.generation_failures + 1
-        retry_status = (
-            RunStatus.REFINEMENT_REQUIRED
-            if failures < dependencies.max_generation_attempts
-            else RunStatus.FAILED
+        failure_ref = _record_failure(
+            dependencies,
+            "generation_contract",
+            "Generated output did not satisfy its strict Pydantic contract.",
+            error,
         )
-        try:
-            generated = GenerationOutput.model_validate(interrupt(prompt.model_dump(mode="json")))
-            undeclared = [
-                item.path for item in generated.files if item.path not in state.target_files
-            ]
-            if undeclared:
-                raise ValueError(f"generated files are not approved target paths: {undeclared}")
-        except (ValidationError, ValueError) as error:
-            failure_ref = record_failure(
-                "generation_contract",
-                "Generated output did not satisfy its strict Pydantic contract.",
-                error,
-            )
-            patch = GraphPatch(
+        return _validated_patch(
+            state,
+            GraphPatch(
                 generation_attempts=attempt,
                 generation_failures=failures,
                 failure_report=failure_ref,
-                status=retry_status,
-            )
-            return _validated_patch(state, patch)
-        original_files = state.original_files
-        try:
-            for item in generated.files:
-                if all(original.path != item.path for original in original_files):
-                    # Record each file before the run first changes it, so a failed run can
-                    # undo it, including files written before a later write fails.
-                    original_files = (
-                        *original_files,
-                        snapshot_original(state.workspace_id, item.path),
-                    )
-                dependencies.workspaces.write_text(state.workspace_id, item.path, item.content)
-        except (ArtifactError, OSError) as error:
-            failure_ref = record_failure(
-                "workspace_write", "A generated file could not be written.", error
-            )
-            patch = GraphPatch(
-                generation_attempts=attempt,
-                original_files=original_files,
-                failure_report=failure_ref,
-                status=RunStatus.FAILED,
-            )
-            return _validated_patch(state, patch)
-        generated_ref = dependencies.artifacts.put_model(generated)
-        patch = GraphPatch(
-            original_files=original_files,
+                status=_contract_retry_status(dependencies, attempt, failures),
+            ),
+        )
+    generated_ref = dependencies.artifacts.put_model(generated)
+    return _validated_patch(
+        state,
+        GraphPatch(
             generated_artifact=generated_ref,
-            failure_report=None,
             generation_attempts=attempt,
+            status=RunStatus.GENERATED,
+        ),
+    )
+
+
+def check_contract_node(
+    raw_state: GraphState, *, dependencies: EngineDependencies
+) -> dict[str, object]:
+    """Reject generated paths outside this run's approved target list."""
+    state = _validate_state(raw_state)
+    if state.generated_artifact is None:
+        failure_ref = _record_failure(
+            dependencies, "missing_generation", "The submission has no generated artifact."
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    generated = dependencies.artifacts.get_model(
+        state.generated_artifact, GenerationOutput, MAX_GENERATED_ARTIFACT_BYTES
+    )
+    undeclared = [item.path for item in generated.files if item.path not in state.target_files]
+    if not undeclared:
+        return _validated_patch(state, GraphPatch(status=RunStatus.GENERATED))
+    failures = state.generation_failures + 1
+    failure_ref = _record_failure(
+        dependencies,
+        "generation_contract",
+        "Generated output includes paths outside the approved target files.",
+        ValueError(f"generated files are not approved target paths: {undeclared}"),
+    )
+    return _validated_patch(
+        state,
+        GraphPatch(
+            generation_failures=failures,
+            failure_report=failure_ref,
+            status=_contract_retry_status(dependencies, state.generation_attempts, failures),
+        ),
+    )
+
+
+def apply_files_node(
+    raw_state: GraphState, *, dependencies: EngineDependencies
+) -> dict[str, object]:
+    """Snapshot and write each approved whole file."""
+    state = _validate_state(raw_state)
+    if state.generated_artifact is None:
+        failure_ref = _record_failure(
+            dependencies, "missing_generation", "Files cannot be applied without a submission."
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    generated = dependencies.artifacts.get_model(
+        state.generated_artifact, GenerationOutput, MAX_GENERATED_ARTIFACT_BYTES
+    )
+    original_files = state.original_files
+    try:
+        for item in generated.files:
+            if all(original.path != item.path for original in original_files):
+                original_files = (
+                    *original_files,
+                    _snapshot_original(dependencies, state.workspace_id, item.path),
+                )
+            dependencies.workspaces.write_text(state.workspace_id, item.path, item.content)
+    except (ArtifactError, OSError) as error:
+        failure_ref = _record_failure(
+            dependencies, "workspace_write", "A generated file could not be written.", error
+        )
+        return _validated_patch(
+            state,
+            GraphPatch(
+                original_files=original_files, failure_report=failure_ref, status=RunStatus.FAILED
+            ),
+        )
+    return _validated_patch(
+        state,
+        GraphPatch(
+            original_files=original_files,
+            failure_report=None,
             generation_failures=0,
             status=RunStatus.GENERATED,
+        ),
+    )
+
+
+def validate_node(raw_state: GraphState, *, dependencies: EngineDependencies) -> dict[str, object]:
+    """Run native checks for the target recorded in graph state."""
+    state = _validate_state(raw_state)
+    if state.generated_artifact is None:
+        failure_ref = _record_failure(
+            dependencies, "missing_generation", "Validation cannot run before generation."
         )
-        return _validated_patch(state, patch)
-
-    def validate(raw_state: GraphState) -> dict[str, Any]:
-        state = _validate_state(raw_state)
-        failure_ref: ArtifactRef | None = None
-        if state.generated_artifact is None:
-            failure_ref = record_failure(
-                "missing_generation", "Validation cannot run before a generated artifact exists."
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-
-        try:
-            generated = dependencies.artifacts.get_model(
-                state.generated_artifact, GenerationOutput, MAX_GENERATED_ARTIFACT_BYTES
-            )
-            workspace = dependencies.workspaces.get(state.workspace_id)
-        except ArtifactError as error:
-            failure_ref = record_failure(
-                "artifact_contract", "The generated artifact or workspace is unavailable.", error
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-        if any(item.path not in state.target_files for item in generated.files):
-            failure_ref = record_failure(
-                "artifact_contract",
-                "A stored generated file is outside the approved target paths.",
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-        try:
-            report = dependencies.validator.validate(target, workspace)
-        except ValidationInfrastructureError as error:
-            # The generated code was never checked; repairing it cannot fix the toolchain.
-            failure_ref = record_failure(
-                "validation_infrastructure", "Native checks could not be executed.", error
-            )
-            patch = GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
-            return _validated_patch(state, patch)
-        report_ref = dependencies.artifacts.put_model(report)
-        next_attempt = state.validation_attempts + 1
-        if report.passed:
-            status = RunStatus.VALIDATED
-            failure_ref = None
-        else:
-            failure = FailureReport(
-                category="native_validation",
-                summary=report.summary,
-                diagnostics=_format_report(report),
-            )
-            failure_ref = dependencies.artifacts.put_model(failure)
-            status = (
-                RunStatus.VALIDATION_FAILED
-                if next_attempt < dependencies.max_validation_attempts
-                else RunStatus.FAILED
-            )
-        patch = GraphPatch(
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    try:
+        generated = dependencies.artifacts.get_model(
+            state.generated_artifact, GenerationOutput, MAX_GENERATED_ARTIFACT_BYTES
+        )
+        workspace = dependencies.workspaces.get(state.workspace_id)
+    except ArtifactError as error:
+        failure_ref = _record_failure(
+            dependencies,
+            "artifact_contract",
+            "The generated artifact or workspace is unavailable.",
+            error,
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    if any(item.path not in state.target_files for item in generated.files):
+        failure_ref = _record_failure(
+            dependencies, "artifact_contract", "A stored generated file is outside approved paths."
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    try:
+        report = dependencies.validator.validate(state.target, workspace)
+    except ValidationInfrastructureError as error:
+        failure_ref = _record_failure(
+            dependencies, "validation_infrastructure", "Native checks could not be executed.", error
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    report_ref = dependencies.artifacts.put_model(report)
+    next_attempt = state.validation_attempts + 1
+    if report.passed:
+        return _validated_patch(
+            state,
+            GraphPatch(
+                validation_report=report_ref,
+                failure_report=None,
+                validation_feedback=None,
+                validation_attempts=next_attempt,
+                status=RunStatus.VALIDATED,
+            ),
+        )
+    failure_ref = dependencies.artifacts.put_model(
+        FailureReport(
+            category="native_validation", summary=report.summary, diagnostics=_format_report(report)
+        )
+    )
+    status = (
+        RunStatus.VALIDATION_FAILED
+        if next_attempt < dependencies.max_repair_rounds
+        and state.generation_attempts < dependencies.max_total_submissions
+        else RunStatus.FAILED
+    )
+    return _validated_patch(
+        state,
+        GraphPatch(
             validation_report=report_ref,
             failure_report=failure_ref,
             validation_feedback=failure_ref,
             validation_attempts=next_attempt,
             status=status,
-        )
-        return _validated_patch(state, patch)
-
-    _add_strict_node(specialist, "generate", generate)
-    _add_strict_node(specialist, "validate", validate)
-    _add_strict_node(specialist, "rollback", rollback)
-    specialist.add_edge(START, "generate")
-    specialist.add_conditional_edges(
-        "generate",
-        _route_after_generation,
-        {"generate": "generate", "validate": "validate", "rollback": "rollback", "end": END},
+        ),
     )
-    specialist.add_conditional_edges(
-        "validate",
-        _route_after_validation,
-        {"generate": "generate", "rollback": "rollback", "end": END},
-    )
-    specialist.add_edge("rollback", END)
-    return specialist.compile()
 
 
-def _route_target(raw_state: GraphState) -> str:
-    """Validate graph state before selecting a language-specific subgraph."""
+def rollback_node(raw_state: GraphState, *, dependencies: EngineDependencies) -> dict[str, object]:
+    """Restore recorded originals; the service also restores all Git-tree changes."""
     state = _validate_state(raw_state)
-    decision = RouteDecision(destination=_route_name(state.target))
-    return decision.destination
+    try:
+        for original in reversed(state.original_files):
+            content = (
+                None
+                if original.content is None
+                else dependencies.artifacts.get(original.content, MAX_ORIGINAL_FILE_BYTES)
+            )
+            dependencies.workspaces.restore(
+                state.workspace_id,
+                original.path,
+                content,
+                original.mode,
+                original.created_directory,
+            )
+    except (ArtifactError, OSError) as error:
+        cause = (
+            "unknown"
+            if state.failure_report is None
+            else f"failure report {state.failure_report.digest}"
+        )
+        failure_ref = _record_failure(
+            dependencies,
+            "rollback",
+            "The run failed and its workspace changes could not be fully restored.",
+            RuntimeError(f"{error}\n\nOriginal failure: {cause}"),
+        )
+        return _validated_patch(
+            state, GraphPatch(failure_report=failure_ref, status=RunStatus.FAILED)
+        )
+    return _validated_patch(state, GraphPatch(workspace_restored=True))
 
 
-def _route_after_generation(raw_state: GraphState) -> str:
-    """Drop invalid generation updates and retry only within the configured bound."""
+def _contract_retry_status(
+    dependencies: EngineDependencies, attempt: int, failures: int
+) -> RunStatus:
+    """Keep both per-round and whole-run submission counts bounded."""
+    if (
+        failures >= dependencies.max_submissions_per_round
+        or attempt >= dependencies.max_total_submissions
+    ):
+        return RunStatus.FAILED
+    return RunStatus.REFINEMENT_REQUIRED
+
+
+def _route_on_failure(state: GraphState) -> Literal["rollback", "__end__"]:
+    """Restore recorded writes before ending a failed run."""
+    return "rollback" if state.status is RunStatus.FAILED and state.original_files else "__end__"
+
+
+def _route_after_hydration(
+    raw_state: GraphState,
+) -> Literal["await_submission", "rollback", "__end__"]:
+    """Await input only after a prompt was stored successfully."""
+    state = _validate_state(raw_state)
+    if state.status is RunStatus.FAILED or state.prompt_artifact is None:
+        return _route_on_failure(state)
+    return "await_submission"
+
+
+def _route_after_submission(
+    raw_state: GraphState,
+) -> Literal["check_contract", "hydrate", "rollback", "__end__"]:
+    """Send valid payloads to the path contract and invalid ones to repair."""
     state = _validate_state(raw_state)
     if state.status is RunStatus.GENERATED:
-        return RouteDecision(destination="validate").destination
+        return "check_contract"
     if state.status is RunStatus.REFINEMENT_REQUIRED:
-        return RouteDecision(destination="generate").destination
+        return "hydrate"
     return _route_on_failure(state)
 
 
-def _route_after_validation(raw_state: GraphState) -> str:
-    """Return failed native diagnostics to generation or finish the bounded run."""
+def _route_after_contract(
+    raw_state: GraphState,
+) -> Literal["apply_files", "hydrate", "rollback", "__end__"]:
+    """Write approved files or ask for a bounded correction."""
     state = _validate_state(raw_state)
-    if state.status is RunStatus.VALIDATED:
-        return RouteDecision(destination="end").destination
-    if state.status is RunStatus.VALIDATION_FAILED:
-        return RouteDecision(destination="generate").destination
+    if state.status is RunStatus.GENERATED:
+        return "apply_files"
+    if state.status is RunStatus.REFINEMENT_REQUIRED:
+        return "hydrate"
     return _route_on_failure(state)
 
 
-def _route_on_failure(state: GraphState) -> str:
-    """Undo the run's workspace writes before a failed run ends."""
-    if state.status is RunStatus.FAILED and state.original_files:
-        return RouteDecision(destination="rollback").destination
-    return RouteDecision(destination="end").destination
+def _route_after_application(
+    raw_state: GraphState,
+) -> Literal["validate", "rollback", "__end__"]:
+    """Validate only after every file was applied."""
+    state = _validate_state(raw_state)
+    return "validate" if state.status is RunStatus.GENERATED else _route_on_failure(state)
+
+
+def _route_after_validation(
+    raw_state: GraphState,
+) -> Literal["hydrate", "rollback", "__end__"]:
+    """Repair failed checks or finish the bounded run."""
+    state = _validate_state(raw_state)
+    if state.status is RunStatus.VALIDATION_FAILED:
+        return "hydrate"
+    if state.status is RunStatus.VALIDATED:
+        return "__end__"
+    return _route_on_failure(state)
 
 
 def _validate_state(raw_state: GraphState | dict[str, object]) -> GraphState:
@@ -424,16 +563,9 @@ def _add_strict_node(
 
 def _validated_patch(state: GraphState, patch: GraphPatch) -> dict[str, object]:
     """Validate each node output and its merged next state before returning it."""
-    validated_patch = GraphPatch.model_validate(patch)
-    update = validated_patch.model_dump(exclude_unset=True)
+    update: dict[str, object] = patch.model_dump(exclude_unset=True)
     GraphState.model_validate(state.model_dump() | update)
     return update
-
-
-def _route_name(target: Target) -> str:
-    """Convert the fixed target enum into a safe graph node identifier."""
-    decision = RouteDecision(destination=target.value.replace("-", "_"))
-    return decision.destination
 
 
 def _format_report(report: ValidationReport) -> str:

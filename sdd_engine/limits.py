@@ -13,6 +13,8 @@ MAX_FILE_CHARS = 1_000_000
 MAX_SUBMISSION_BYTES = 3_000_000
 MAX_GENERATED_ARTIFACT_BYTES = 4_000_000
 MAX_CONTEXT_BYTES = 2_000_000
+# JSON escaping can expand each hydrated character up to six bytes, plus prompt metadata.
+MAX_PROMPT_ARTIFACT_BYTES = 6 * MAX_CONTEXT_BYTES + 100_000
 MAX_REPORT_BYTES = 1_000_000
 # Existing files must fit in the artifact store before they are overwritten for rollback.
 MAX_ORIGINAL_FILE_BYTES = 16_000_000

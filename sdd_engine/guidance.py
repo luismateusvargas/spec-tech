@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from sdd_engine.artifacts import ArtifactError, ArtifactStore, WorkspaceRegistry
@@ -71,13 +72,20 @@ class PromptHydrator:
 
         specification = load_text(state.specification)
         references = tuple(load_text(reference) for reference in state.context)
-        skills = (f"sdd-implement-{state.tier.value}", *TARGET_SKILLS[state.target])
+        skills = TARGET_SKILLS[state.target]
         guidance = tuple(self._load_skill(name) for name in skills)
         byte_count += sum(len(item.encode("utf-8")) for item in guidance)
         if byte_count > self._max_context_bytes:
             raise ArtifactError(
                 "hydrated context and engineering guidance exceeded the configured limit"
             )
+
+        validation_feedback = None
+        if state.validation_feedback is not None:
+            validation_feedback = load_text(state.validation_feedback)
+        generation_feedback = None
+        if state.failure_report is not None and state.failure_report != state.validation_feedback:
+            generation_feedback = load_text(state.failure_report)
 
         # Show every approved file as it is now: the original on a first attempt, or the
         # previous generation during a repair.
@@ -95,13 +103,6 @@ class PromptHydrator:
                 byte_count += len(content.encode("utf-8"))
                 existing_files.append(WorkspaceFile(path=path, content=content))
 
-        validation_feedback = None
-        if state.validation_feedback is not None:
-            validation_feedback = load_text(state.validation_feedback)
-        generation_feedback = None
-        if state.failure_report is not None and state.failure_report != state.validation_feedback:
-            generation_feedback = load_text(state.failure_report)
-
         return GenerationPrompt(
             run_id=state.run_id,
             target=state.target,
@@ -118,13 +119,21 @@ class PromptHydrator:
 
     def _load_skill(self, skill_name: str) -> str:
         """Read a known project skill at invocation time and reject path escapes."""
-        skill_path = (self._project_root / "skills" / skill_name / "SKILL.md").resolve(strict=True)
-        skill_root = (self._project_root / "skills").resolve(strict=True)
-        if not skill_path.is_relative_to(skill_root):
-            raise ArtifactError(
-                f"skill path {skill_name!r} escaped the configured skills directory"
-            )
-        content = skill_path.read_text(encoding="utf-8")
+        roots = (
+            self._project_root / "skills",
+            Path(sys.prefix) / "share" / "spec-tech-sdd-engine" / "skills",
+            Path("/home/htxzz77/Projects/skills"),
+        )
+        try:
+            skill_root = next(root.resolve(strict=True) for root in roots if root.is_dir())
+            skill_path = (skill_root / skill_name / "SKILL.md").resolve(strict=True)
+            if not skill_path.is_relative_to(skill_root):
+                raise ArtifactError(
+                    f"skill path {skill_name!r} escaped the configured skills directory"
+                )
+            content = skill_path.read_text(encoding="utf-8")
+        except (OSError, StopIteration) as error:
+            raise ArtifactError(f"could not load skill {skill_name!r}") from error
         if len(content.encode("utf-8")) > self._max_context_bytes:
             raise ArtifactError(f"skill {skill_name!r} exceeds the configured context limit")
         return content

@@ -10,7 +10,7 @@ from pathlib import Path
 from sdd_engine import service
 
 # The same split as the implementer and administrator MCP servers.
-IMPLEMENTER_COMMANDS = ("begin_task", "submit", "finish_task", "get_run_report")
+IMPLEMENTER_COMMANDS = ("begin_task", "submit", "finish_task", "cancel_task", "get_run_report")
 ADMIN_COMMANDS = ("configure_profile", "get_profile")
 
 

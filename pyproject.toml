@@ -26,6 +26,19 @@ dev = [
 [tool.setuptools]
 packages = ["sdd_engine"]
 
+[tool.setuptools.data-files]
+"share/spec-tech-sdd-engine/skills/javascript-dev" = ["skills/javascript-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/typescript-dev" = ["skills/typescript-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/python-dev" = ["skills/python-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/rust-dev" = ["skills/rust-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/go-dev" = ["skills/go-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/cpp-dev" = ["skills/cpp-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/cpp-cv-dev" = ["skills/cpp-cv-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/cpp-aaa-dev" = ["skills/cpp-aaa-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/database-dev" = ["skills/database-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/react-dev" = ["skills/react-dev/SKILL.md"]
+"share/spec-tech-sdd-engine/skills/vue-dev" = ["skills/vue-dev/SKILL.md"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -19,6 +19,7 @@ from sdd_engine.models import (
     ArtifactRef,
     GraphInput,
     GraphState,
+    OriginalFile,
     RunPhase,
     RunStatus,
     Target,
@@ -341,3 +342,16 @@ class ProjectStore(BaseArtifactStore):
                 "INSERT OR IGNORE INTO snapshots(run_id, path, original) VALUES (?, ?, ?)",
                 ((run_id, str(item["path"]), json.dumps(item)) for item in originals),
             )
+
+    def snapshots(self, run_id: str) -> tuple[OriginalFile, ...]:
+        """Load pre-write snapshots in the order they were first recorded."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT original FROM snapshots WHERE run_id = ? ORDER BY rowid", (run_id,)
+            ).fetchall()
+        try:
+            return tuple(OriginalFile.model_validate_json(row["original"]) for row in rows)
+        except ValidationError as error:
+            raise ArtifactIntegrityError(
+                f"stored snapshots for run {run_id!r} are invalid"
+            ) from error

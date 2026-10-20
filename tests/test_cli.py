@@ -71,3 +71,19 @@ def test_admin_cannot_run_task_commands(
 
     assert exit_info.value.code == 2
     assert "begin_task is not an administrator command" in capsys.readouterr().err
+
+
+def test_cancel_task_is_an_implementer_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], workspace: Path
+) -> None:
+    def cancel(workspace: str, run_id: str) -> dict[str, object]:
+        return {"run_id": run_id, "phase": "finished"}
+
+    monkeypatch.setattr("sdd_engine.service.cancel_task", cancel)
+    run_cli(
+        monkeypatch,
+        {"workspace": str(workspace), "run_id": "example"},
+        "cancel_task",
+    )
+
+    assert json.loads(capsys.readouterr().out) == {"run_id": "example", "phase": "finished"}

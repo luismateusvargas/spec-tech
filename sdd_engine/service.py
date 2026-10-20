@@ -12,7 +12,6 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from sdd_engine.artifacts import WorkspaceRegistry
 from sdd_engine.errors import (
-    ArtifactError,
     ProfileError,
     RunStateError,
     SpecContractError,
@@ -26,6 +25,7 @@ from sdd_engine.models import (
     GenerationOutput,
     GraphInput,
     GraphState,
+    OriginalFile,
     RunPhase,
     RunStatus,
     Target,
@@ -252,23 +252,30 @@ def begin_task(
 
 def submit(workspace: str, run_id: str, files: dict[str, object]) -> dict[str, object]:
     """Resume a pending run with the implementer's structured generation result."""
-    root, store, record = _run_store(workspace, run_id)
-    stored_profile = _current_profile(store, record)
-    if record.phase is not RunPhase.PENDING or record.prompt is None:
-        raise RunStateError("run is not awaiting a submission")
-    with store.connect() as connection:
-        result = _engine(store, root, run_id, stored_profile, connection).submit(
-            run_id, run_id, files
-        )
-    try:
-        generated = GenerationOutput.model_validate(files)
-    except ValueError:
-        generated = None
-    if generated is not None:
-        previous = set(record.submitted)
-        previous.update(item.path for item in generated.files)
-        store.update_run(run_id, submitted=json.dumps(sorted(previous)))
-    _persist_step(store, run_id, result)
+    root, store, _ = _run_store(workspace, run_id)
+    registry = WorkspaceRegistry({run_id: root})
+    with registry.lock(run_id):
+        record = store.run(run_id)
+        if record.phase is not RunPhase.PENDING or record.prompt is None:
+            raise RunStateError("run is not awaiting a submission")
+        stored_profile = _current_profile(store, record)
+        try:
+            generated = GenerationOutput.model_validate(files)
+        except ValueError:
+            generated = None
+        try:
+            if generated is not None:
+                previous = set(record.submitted)
+                previous.update(item.path for item in generated.files)
+                store.update_run(run_id, submitted=json.dumps(sorted(previous)))
+            with store.connect() as connection:
+                result = _engine(store, root, run_id, stored_profile, connection).submit(
+                    run_id, run_id, files, workspace_locked=True
+                )
+            _persist_step(store, run_id, result)
+        except Exception:
+            _finalize_run(root, store, store.run(run_id), failed=True)
+            raise
     return {"run_id": run_id, **result}
 
 
@@ -291,31 +298,107 @@ def _persist_step(store: ProjectStore, run_id: str, result: dict[str, object]) -
 
 def finish_task(workspace: str, run_id: str) -> dict[str, object]:
     """Diff the run's Git trees and restore all changes after a failed run."""
-    root, store, record = _run_store(workspace, run_id)
-    if record.phase is RunPhase.FINISHED:
-        return get_run_report(workspace, run_id)
-    _current_profile(store, record)
-    if record.phase is not RunPhase.TERMINAL:
-        raise RunStateError("run is still awaiting an implementer submission")
-    start_tree = record.start_tree
-    finish_tree = worktree_tree(root, preserve=tree_paths(root, start_tree))
-    report = scope_report(
-        root,
-        start_tree,
-        finish_tree,
-        set(record.submitted),
-        set(record.request.target_files),
-    )
-    report["head_changed"] = head(root) != record.head
-    if record.outcome is RunStatus.FAILED:
-        try:
-            restore_tree(root, start_tree, finish_tree, record.head)
-            report["restored"] = True
-        except ArtifactError as error:
-            report["restored"] = False
-            report["rollback_error"] = str(error)
-    store.update_run(run_id, scope_report=json.dumps(report), phase=RunPhase.FINISHED.value)
+    root, store, _ = _run_store(workspace, run_id)
+    with WorkspaceRegistry({run_id: root}).lock(run_id):
+        record = store.run(run_id)
+        if record.phase is RunPhase.FINISHED:
+            return get_run_report(workspace, run_id)
+        _current_profile(store, record)
+        if record.phase is not RunPhase.TERMINAL:
+            raise RunStateError("run is still awaiting an implementer submission")
+        _finalize_run(root, store, record, failed=record.outcome is RunStatus.FAILED)
     return get_run_report(workspace, run_id)
+
+
+def cancel_task(workspace: str, run_id: str) -> dict[str, object]:
+    """Abort an owned run, restore its worktree, and free its active slot."""
+    root, store, _ = _run_store(workspace, run_id)
+    with WorkspaceRegistry({run_id: root}).lock(run_id):
+        record = store.run(run_id)
+        if record.phase is not RunPhase.FINISHED:
+            _finalize_run(root, store, record, failed=True)
+    return get_run_report(workspace, run_id)
+
+
+def _restore_originals(
+    root: Path, store: ProjectStore, record: RunRecord, originals: tuple[OriginalFile, ...]
+) -> None:
+    """Restore recorded pre-write bytes before the broader Git-tree restoration."""
+    registry = WorkspaceRegistry({record.run_id: root})
+    for original in reversed(originals):
+        content = (
+            None
+            if original.content is None
+            else store.get(original.content, original.content.byte_length)
+        )
+        registry.restore(
+            record.run_id, original.path, content, original.mode, original.created_directory
+        )
+
+
+def _finalize_run(root: Path, store: ProjectStore, record: RunRecord, *, failed: bool) -> None:
+    """Persist scope and terminal phase even when a restoration step fails."""
+    report: dict[str, object] = {"start_tree": record.start_tree, "changes": []}
+    finish_tree: str | None = None
+    head_changed: bool | None = None
+    errors: list[str] = []
+    try:
+        head_changed = head(root) != record.head
+        finish_tree = worktree_tree(root, preserve=tree_paths(root, record.start_tree))
+        report = scope_report(
+            root,
+            record.start_tree,
+            finish_tree,
+            set(record.submitted),
+            set(record.request.target_files),
+        )
+        report["head_changed"] = head_changed
+    except Exception as error:
+        # Finalization must record a failed run even when scope inspection fails.
+        errors.append(str(error))
+    if failed:
+        # Graph rollback may have erased a generated file before the final Git diff.
+        findings = report.get("changes", [])
+        if isinstance(findings, list):
+            existing = {item["path"] for item in findings if isinstance(item, dict)}
+            for path in sorted(set(record.submitted) & set(record.request.target_files) - existing):
+                findings.append({"path": path, "label": "declared", "flags": []})
+            findings.sort(key=lambda item: str(item["path"]))
+        if head_changed is False:
+            try:
+                originals = (
+                    record.state.original_files
+                    if record.state is not None
+                    else store.snapshots(record.run_id)
+                )
+                _restore_originals(root, store, record, originals)
+            except Exception as error:
+                errors.append(str(error))
+        if finish_tree is not None:
+            try:
+                restore_tree(root, record.start_tree, finish_tree, record.head)
+            except Exception as error:
+                errors.append(str(error))
+        report["restored"] = not errors
+        if errors:
+            report["rollback_error"] = "; ".join(errors)
+    elif errors:
+        report["scope_error"] = "; ".join(errors)
+    final_state = record.state
+    if failed and final_state is not None:
+        final_state = final_state.model_copy(update={"status": RunStatus.FAILED})
+    store.update_run(
+        record.run_id,
+        scope_report=json.dumps(report),
+        phase=RunPhase.FINISHED.value,
+        outcome=RunStatus.FAILED.value
+        if failed
+        else record.outcome.value
+        if record.outcome
+        else None,
+        state=None if final_state is None else final_state.model_dump_json(),
+        prompt=None,
+    )
 
 
 def get_run_report(workspace: str, run_id: str) -> dict[str, object]:

@@ -89,6 +89,12 @@ def finish_task(workspace: str, run_id: str) -> dict[str, object]:
 
 
 @implementer.tool()
+def cancel_task(workspace: str, run_id: str) -> dict[str, object]:
+    """Abort a pending or completed run and restore its worktree changes."""
+    return service.cancel_task(workspace, run_id)
+
+
+@implementer.tool()
 def get_run_report(workspace: str, run_id: str) -> dict[str, object]:
     """Read the run's prompt, validation diagnostics, and scope report."""
     return service.get_run_report(workspace, run_id)
