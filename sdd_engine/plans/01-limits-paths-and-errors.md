@@ -1,6 +1,6 @@
 # Plan 01: Shared Limits, Canonical Path Validation, and Domain Error Taxonomy
 
-Status: ready
+Status: done
 Project rules: AGENTS.md, docs/coding/common.md, docs/coding/python.md, skills/python-dev/SKILL.md
 Target files: sdd_engine/limits.py, sdd_engine/errors.py, sdd_engine/paths.py, sdd_engine/models.py, sdd_engine/artifacts.py, sdd_engine/scope.py, tests/test_models.py, tests/test_artifacts.py
 Depends on: none

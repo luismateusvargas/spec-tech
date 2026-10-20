@@ -1,6 +1,6 @@
 # Plan 03: Typed Persistence, Artifact Store Deduplication, and Worktree Ownership
 
-Status: ready
+Status: done
 Project rules: AGENTS.md, docs/coding/common.md, docs/coding/python.md, skills/python-dev/SKILL.md
 Target files: sdd_engine/store.py, sdd_engine/artifacts.py, sdd_engine/service.py, sdd_engine/models.py, tests/test_artifacts.py, tests/test_graph.py
 Depends on: 01-limits-paths-and-errors.md, 02-sandbox-and-profile-hardening.md

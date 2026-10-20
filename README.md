@@ -1,45 +1,202 @@
 # spec-tech
 
-A portable, cross-agent spec-driven development (SDD) toolkit. It contains short project instructions, coding references loaded when relevant, and a four-stage SDD workflow for simple code, SaaS, and games. Codex, Claude Code, and Google Antigravity can use the same project definitions and task specs.
+`spec-tech` is a portable, cross-agent **Spec-Driven Development (SDD)** toolkit and **pointer-based LangGraph orchestration engine** (`sdd_engine`). It combines:
 
-**Cross-agent memory requires [Caipira](docs/caipira.md), installed separately on each machine.** Caipira keeps prior decisions and work history available across those clients; this repository contains no memory database or Caipira runtime.
+1. **Compact agent instructions and on-demand coding guides** (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `docs/coding/`) shared across coding clients.
+2. **Twenty-three specialized skills** (`skills/`): twelve tiered SDD workflow skills (`orchestrate`, `plan`, `implement`, `review` across `simple`, `saas`, and `game`), shared templates (`skills/sdd-shared/`), and eleven language/framework/database engineering skills (`*-dev`).
+3. **An agent-neutral SDD execution engine** ([`sdd_engine/`](sdd_engine/README.md)): a LangGraph + SQLite + MCP/CLI orchestration runtime that hydrates specs and engineering skills into bounded prompts, validates whole-file submissions against strict Pydantic contracts, executes native compiler/linter/test checks inside network-isolated Docker containers, and produces diff-based scope reports with automatic rollback on failure.
+4. **Cross-agent durable memory** via **[Caipira](docs/caipira.md)** so decisions, constraints, and evidence-backed facts persist across sessions and coding clients.
 
-## What is in this repository
+---
+
+## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | Shared coding and memory behavior |
-| [CLAUDE.md](CLAUDE.md), [GEMINI.md](GEMINI.md) | Small client entry files that refer to `AGENTS.md` |
-| [docs/coding/](docs/coding/README.md) | Common guide and on-demand guides for Python, Node.js, TypeScript, Go, C#, C++, Rust, and Shell |
-| `skills/sdd-{orchestrate,plan,implement,review}-{simple,saas,game}/` | Twelve active workflow skills |
-| [skills/sdd-shared/templates/](skills/sdd-shared/templates/) | Questionnaires, project and domain definitions, task specs, and security baseline |
-| [docs/caipira.md](docs/caipira.md) | Caipira usage, installation dependency, and client configuration |
-| [docs/git-workflow-reference.md](docs/git-workflow-reference.md), [docs/versioning-best-practices.md](docs/versioning-best-practices.md) | Additional references when Git or versioning decisions arise |
+| [`AGENTS.md`](AGENTS.md) | Shared coding rules, verification requirements, skill-mirroring policy, and Caipira memory workflow |
+| [`CLAUDE.md`](CLAUDE.md), [`GEMINI.md`](GEMINI.md) | Client entry files importing `AGENTS.md` for Claude Code, Gemini CLI, and Antigravity |
+| [`docs/coding/`](docs/coding/README.md) | [Common coding guide](docs/coding/common.md) plus on-demand guides for [Python](docs/coding/python.md), [Node.js](docs/coding/nodejs.md), [TypeScript](docs/coding/typescript.md), [Go](docs/coding/go.md), [C#](docs/coding/csharp.md), [C++](docs/coding/cpp.md), [Rust](docs/coding/rust.md), and [Shell](docs/coding/shell.md) |
+| [`docs/caipira.md`](docs/caipira.md) | Cross-agent memory workflow, runtime requirements, and client registration |
+| [`docs/git-workflow-reference.md`](docs/git-workflow-reference.md), [`docs/versioning-best-practices.md`](docs/versioning-best-practices.md) | Reference guides for Git branching/worktrees and semantic versioning |
+| `skills/sdd-{orchestrate,plan,implement,review}-{simple,saas,game}/` | Twelve active SDD workflow skills organized by stage and project tier |
+| [`skills/sdd-shared/templates/`](skills/sdd-shared/templates/) | Shared questionnaires, project/constitution/domain YAML & Markdown templates, task spec templates, [engine protocol](skills/sdd-shared/templates/engine-protocol.md), [Git checkpoints](skills/sdd-shared/templates/git-checkpoints.md), [scope guide](skills/sdd-shared/templates/scope-guide.md), and [counter-plan template](skills/sdd-shared/templates/review.counter-plan.template.md) |
+| `skills/*-dev/` | Eleven engineering skills injected by the SDD engine and used directly by coding agents |
+| [`sdd_engine/`](sdd_engine/README.md) | Pointer-based LangGraph orchestration engine, SQLite store, Docker sandbox validator, MCP servers, and CLI |
+| [`toolchains/`](toolchains/README.md) | Digest-pinned Dockerfiles (`python.Dockerfile`, `rust.Dockerfile`, `go.Dockerfile`) for offline container validation |
+| [`tests/`](tests/) | Unit and real-container integration tests for contracts, artifacts, graph lifecycle, CLI, and Docker sandboxing |
 
-The older `skills/sdd-implement/` and top-level `templates/` remain in the tree for existing users. New installations should use the twelve tiered skills and their `sdd-shared` sibling directory. The temporary `.reference-repos/` benchmark checkouts are development material, not part of the package.
+The older [`skills/sdd-implement/`](skills/sdd-implement/SKILL.md) and top-level `templates/` remain in the tree as deprecated legacy material for existing users. New work uses the twelve tiered SDD skills and `skills/sdd-shared/`.
 
-### Shared skills on this workstation
+---
 
-The three local agents read the same `/home/htxzz77/Projects/skills/` directory through their global skill locations:
+## Skills catalog
 
-| Client | Global skill path linked to the shared directory |
-| --- | --- |
-| Codex | `~/.agents/skills` |
-| Claude Code | `~/.claude/skills` |
-| Antigravity IDE / 2.0 | `~/.gemini/config/skills` |
-| Antigravity CLI | `~/.gemini/antigravity-cli/skills` |
+### 1. SDD workflow skills (12 skills + `sdd-shared`)
 
-Update the shared directory alongside this repository's `skills/` tree. The project installation steps below are for machines or client settings that do not use this shared directory. Local global skills do not automatically carry into cloud sessions.
+Choose one tier for a project (`simple`, `saas`, or `game`) and run the relevant stage skill:
 
-## Set up a project
+| Stage | Simple script, utility, or compact app | Hosted multi-user SaaS or service | Large or AAA game |Purpose |
+| --- | --- | --- | --- | --- |
+| **Orchestrate** | [`sdd-orchestrate-simple`](skills/sdd-orchestrate-simple/SKILL.md) | [`sdd-orchestrate-saas`](skills/sdd-orchestrate-saas/SKILL.md) | [`sdd-orchestrate-game`](skills/sdd-orchestrate-game/SKILL.md) | Bootstrap or refresh project, constitution, and domain definitions using the [orchestrator questionnaire](skills/sdd-shared/templates/orchestrator.questionnaire.md) |
+| **Plan** | [`sdd-plan-simple`](skills/sdd-plan-simple/SKILL.md) | [`sdd-plan-saas`](skills/sdd-plan-saas/SKILL.md) | [`sdd-plan-game`](skills/sdd-plan-game/SKILL.md) | Split topics via the [scope guide](skills/sdd-shared/templates/scope-guide.md) into one bounded task spec per outcome with `Status: ready` and `Target files:` |
+| **Implement** | [`sdd-implement-simple`](skills/sdd-implement-simple/SKILL.md) | [`sdd-implement-saas`](skills/sdd-implement-saas/SKILL.md) | [`sdd-implement-game`](skills/sdd-implement-game/SKILL.md) | Execute a ready spec with [local Git checkpoints](skills/sdd-shared/templates/git-checkpoints.md) and the [SDD engine protocol](skills/sdd-shared/templates/engine-protocol.md) |
+| **Review** | [`sdd-review-simple`](skills/sdd-review-simple/SKILL.md) | [`sdd-review-saas`](skills/sdd-review-saas/SKILL.md) | [`sdd-review-game`](skills/sdd-review-game/SKILL.md) | Independently audit implementation commits and engine scope reports; emit a local `sdd/approved/*` tag or a [counter-plan](skills/sdd-shared/templates/review.counter-plan.template.md) |
 
-1. Obtain this repository and choose the target project root.
-2. Install [Caipira](docs/caipira.md) on each machine that will use cross-agent memory. Install the coding clients first, then run Caipira's installer so it can register all of them.
-3. Copy the three root instruction files and `docs/coding/` into the target project, keeping the same relative layout. If the project already has an `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`, merge the instructions instead of overwriting its own rules. The root files in this repository are ready to use when working on spec-tech itself.
-4. If the clients do not use the shared global directory, install the active skills into the project skill locations shown below. Keep `sdd-shared/` beside the twelve skill folders because their relative links use it.
-5. Restart each client, check that the skills are listed, and confirm a focused Caipira search works in the target project.
+### 2. Engineering (`*-dev`) skills (11 skills)
 
-For macOS/Linux, this copies the skill suite to the two project locations used by the three clients. Set the paths to your actual checkout and target project before running it:
+These skills provide strict rules for modularity, typing, ownership, data validation, error handling, and testing. Agents load them automatically when working in matching languages, and `sdd_engine` hydrates them into prompts based on the run's target ([`sdd_engine/targets.py`](sdd_engine/targets.py)):
+
+| Skill | Scope | Engine targets using this skill |
+| --- | --- | --- |
+| [`python-dev`](skills/python-dev/SKILL.md) | Modular, strictly typed Python (`ruff`, `mypy --strict`, `pytest`, Pydantic v2, `Protocol` DI) | `python`, `sqlalchemy-alembic` |
+| [`javascript-dev`](skills/javascript-dev/SKILL.md) | Browser and Node.js JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`) | `javascript`, `prisma-javascript`, `react-javascript`, `vue-javascript` |
+| [`typescript-dev`](skills/typescript-dev/SKILL.md) | Strictly typed TypeScript (`.ts`, `.tsx`, `tsc --noEmit`) | `typescript`, `prisma-typescript`, `react-typescript`, `vue-typescript` |
+| [`react-dev`](skills/react-dev/SKILL.md) | React component architecture, hooks, state, accessibility, and performance | `react-javascript`, `react-typescript` |
+| [`vue-dev`](skills/vue-dev/SKILL.md) | Vue `.vue` single-file components, composables, and reactivity | `vue-javascript`, `vue-typescript` |
+| [`rust-dev`](skills/rust-dev/SKILL.md) | Idiomatic Rust ownership, error types, `cargo check`, `clippy -D warnings`, and tests | `rust`, `diesel` |
+| [`go-dev`](skills/go-dev/SKILL.md) | Go services, explicit error handling, concurrency lifetimes, `go vet`, and `go test` | `go` |
+| [`cpp-dev`](skills/cpp-dev/SKILL.md) | Modern C++ modularity, RAII ownership, error boundaries, CMake, and CTest | `cpp`, `cpp-cv`, `cpp-aaa` |
+| [`cpp-cv-dev`](skills/cpp-cv-dev/SKILL.md) | C++ computer vision, image/tensor layout, alignment, SIMD, and high-throughput pipelines | `cpp-cv` |
+| [`cpp-aaa-dev`](skills/cpp-aaa-dev/SKILL.md) | C++ AAA game engines, deterministic simulation, ECS, cache locality, and frame budgets | `cpp-aaa` |
+| [`database-dev`](skills/database-dev/SKILL.md) | SQL schemas, migrations, transactional safety, Prisma, SQLAlchemy/Alembic, and Diesel | `mysql`, `postgresql`, `prisma-javascript`, `prisma-typescript`, `sqlalchemy-alembic`, `diesel` |
+
+---
+
+## Pre-configured agents and client integration
+
+`spec-tech` is designed so multiple agents can collaborate on the same repository—for example, one agent orchestrating or planning, a subagent implementing through `sdd_engine`, and another agent performing an independent review.
+
+### Workstation shared skill directory
+
+On this workstation, the local coding agents share `/home/htxzz77/Projects/skills/` through their global skill paths:
+
+| Agent / Client | Project instructions | Project-local skill path | Global skill path (linked to `/home/htxzz77/Projects/skills`) | Caipira MCP & hooks config |
+| --- | --- | --- | --- | --- |
+| **OpenAI Codex** | `<project>/AGENTS.md` | `<project>/.agents/skills/` | `~/.agents/skills` | `~/.codex/config.toml` |
+| **Claude Code** | `<project>/CLAUDE.md` (imports `AGENTS.md`) | `<project>/.claude/skills/` | `~/.claude/skills` | `~/.claude.json` & `~/.claude/settings.json` |
+| **Antigravity IDE / 2.0** | `<project>/AGENTS.md` & `GEMINI.md` | `<project>/.agents/skills/` | `~/.gemini/config/skills` | `~/.gemini/config/mcp_config.json` & `hooks.json` |
+| **Antigravity CLI (`agy`)** | `<project>/AGENTS.md` & `GEMINI.md` | `<project>/.agents/skills/` | `~/.gemini/antigravity-cli/skills` | `~/.gemini/config/mcp_config.json` & `hooks.json` |
+| **Sota** (`~/Projects/sota`) | `<project>/AGENTS.md` | Worktree-isolated runner | Reads `/home/htxzz77/Projects/skills` | Connects via `sota_infra/src/mcp_client.rs` |
+
+When editing any active skill or shared template under `skills/` in this repository, copy the change to `/home/htxzz77/Projects/skills/` and verify with `diff -ru` that both trees match.
+
+### Agent roles in the SDD Engine
+
+The SDD engine (`sdd_engine`) is **model- and agent-neutral**—it makes no LLM API calls and holds no model credentials:
+
+- **Administrator (`spec-tech-engine-config`)**: Configures and inspects per-target container validation profiles (`configure_profile`, `get_profile`). Runs only when launched with `--admin`.
+- **Planner (`sdd-plan-{simple,saas,game}`)**: Produces a bounded task spec with `Status: ready` and `Target files:`, commits the baseline checkpoint, and selects the implementer model.
+- **Implementer (`spec-tech-engine` / `sdd-implement-{simple,saas,game}`)**: Calls `begin_task`, receives the hydrated `GenerationPrompt` (containing the spec, target `*-dev` skills, existing target files, and `submission_schema`), submits whole-file replacements with `submit`, repairs any contract or compiler/test failures (up to 3 attempts per round, 3 validation rounds, 9 total submissions), and finalizes with `finish_task` (or aborts with `cancel_task`).
+- **Reviewer (`sdd-review-{simple,saas,game}`)**: Calls `get_run_report` to inspect `validation_report` and `scope_report` (which flags undeclared edits, test deletions/modifications, check-config changes, and added lint/type/test suppressions or skips) before tagging `sdd/approved/<task-slug>-<short-sha>` or issuing a counter-plan.
+
+---
+
+## Dependencies
+
+### 1. Core workflow & memory dependencies
+
+- **Git** (`>= 2.38` recommended): Required for worktree management, committed spec verification (`git ls-tree`, `git cat-file`), and private-index tree diffing/restoration in `sdd_engine`.
+- **[Caipira](docs/caipira.md)** (external local-first MCP service):
+  - Required for cross-agent memory (`search_facts`, `record_fact`, `update_fact`, `check_drift`, `timeline`).
+  - Must be installed from a complete Caipira distribution that includes its **bundled Node.js 22.20.0 runtime** and local embedding model (do not run Caipira's `better-sqlite3` build under system Node 24).
+
+### 2. SDD Engine (`spec-tech-sdd-engine`) dependencies
+
+- **Python `>= 3.11`** and **[`uv`](https://docs.astral.sh/uv/)** (or `pip` / `venv`).
+- **Runtime Python packages** (declared in [`pyproject.toml`](pyproject.toml)):
+  - `langgraph >= 1.0, < 2.0`
+  - `langgraph-checkpoint-sqlite >= 3.0, < 4.0`
+  - `langchain-core >= 1.0, < 2.0`
+  - `mcp >= 1.0, < 2.0` (FastMCP stdio server)
+  - `pydantic >= 2.7, < 3.0`
+  - `typing-extensions >= 4.12`
+- **Development & verification packages**:
+  - `pytest >= 8.3, < 10`
+  - `ruff >= 0.11, < 1.0`
+  - `mypy >= 1.15, < 2.0`
+- **Docker** (for native validation in [`sdd_engine/validation.py`](sdd_engine/validation.py)):
+  - **Rootless Docker** is strongly recommended (`DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock`). Under rootless Docker, container `root` (`0:0`) maps directly to the host user UID/GID; on a rootful daemon, `DockerCommandRunner` automatically passes `--user <uid>:<gid>`.
+  - Validation containers run with `--pull=never`, `--network=none`, `--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and bounded PIDs/CPUs/memory/timeout against a disposable `.git`-free staged copy of the worktree. All toolchain images and project dependencies must therefore be present locally before a run starts.
+
+---
+
+## Installation and setup
+
+### 1. Install the Python environment and SDD engine
+
+From this repository root:
+
+```sh
+uv sync
+```
+
+Or install into a standard virtual environment:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+### 2. Build the validation toolchain Docker images
+
+Build the digest-pinned toolchain images in [`toolchains/`](toolchains/README.md) before configuring validation profiles:
+
+```sh
+docker build -f toolchains/python.Dockerfile -t spec-tech/python:3.12.12-r1 .
+docker build -f toolchains/rust.Dockerfile -t spec-tech/rust:1.91.1-r1 .
+docker build -f toolchains/go.Dockerfile -t spec-tech/go:1.26-r1 .
+```
+
+Configure a target profile in a project Git worktree using the administrator CLI (omitting `commands` populates the target's default checks from [`sdd_engine/targets.py`](sdd_engine/targets.py)):
+
+```sh
+uv run python -m sdd_engine.cli --admin configure_profile <<'EOF'
+{
+  "workspace": "/path/to/your-project",
+  "target": "python",
+  "profile": {
+    "image": "spec-tech/python:3.12.12-r1"
+  }
+}
+EOF
+```
+
+### 3. Register the MCP servers in your coding clients
+
+Expose the **implementer** server (`python -m sdd_engine.mcp_server`) to coding agents. Keep the **administrator** server (`python -m sdd_engine.mcp_server --admin`) restricted to operator/admin sessions:
+
+```json
+{
+  "mcpServers": {
+    "spec-tech-engine": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/spec-tech",
+        "run",
+        "python",
+        "-m",
+        "sdd_engine.mcp_server"
+      ]
+    }
+  }
+}
+```
+
+### 4. Install Caipira for cross-agent memory
+
+Install the coding clients first, then run Caipira's installer with its bundled Node 22 binary (see [`docs/caipira.md`](docs/caipira.md) for Windows and troubleshooting details):
+
+```sh
+CAIPIRA_ROOT=/path/to/caipira
+"$CAIPIRA_ROOT/node22/node-v22.20.0-linux-x64/bin/node" "$CAIPIRA_ROOT/install.js" install
+"$CAIPIRA_ROOT/node22/node-v22.20.0-linux-x64/bin/node" "$CAIPIRA_ROOT/install.js" doctor
+```
+
+### 5. Install instructions and skills into a target project
+
+1. Copy `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and `docs/coding/` into the target project root (or merge with existing instruction files).
+2. If your clients do not already link to `/home/htxzz77/Projects/skills/`, copy the twelve SDD workflow skills, `sdd-shared`, and the eleven `*-dev` engineering skills into the project skill directories (`.agents/skills/` serves both Codex and Antigravity; `.claude/skills/` serves Claude Code):
 
 ```sh
 SPEC_TECH=/path/to/spec-tech
@@ -52,51 +209,37 @@ for destination in "$TARGET/.agents/skills" "$TARGET/.claude/skills"; do
       cp -R "$SPEC_TECH/skills/sdd-$phase-$tier" "$destination/"
     done
   done
+  for dev_skill in \
+    python-dev javascript-dev typescript-dev react-dev vue-dev \
+    rust-dev go-dev cpp-dev cpp-cv-dev cpp-aaa-dev database-dev; do
+    cp -R "$SPEC_TECH/skills/$dev_skill" "$destination/"
+  done
   cp -R "$SPEC_TECH/skills/sdd-shared" "$destination/"
 done
 ```
 
-On Windows, copy the same thirteen directories with Explorer or PowerShell, preserving each directory's `SKILL.md` and the `sdd-shared/templates/` files. Install only the destination for the clients you use.
+---
 
-### Client configuration
+## Verification and maintenance
 
-| Client | Project instructions | Project skills | Caipira registration |
-| --- | --- | --- | --- |
-| Codex | `<project>/AGENTS.md` | `<project>/.agents/skills/` | `~/.codex/config.toml` |
-| Claude Code | `<project>/CLAUDE.md` imports `AGENTS.md` | `<project>/.claude/skills/` | `~/.claude.json` and `~/.claude/settings.json` |
-| Antigravity IDE / Antigravity 2.0 | `<project>/AGENTS.md` and `GEMINI.md` | `<project>/.agents/skills/` | `~/.gemini/config/mcp_config.json` and `hooks.json` |
-| Antigravity CLI | `<project>/AGENTS.md` and `GEMINI.md` | `<project>/.agents/skills/` | Same Caipira configuration when supported by the installed client |
+Run the test suite, linter, formatter check, and strict type checker with `uv`:
 
-`GEMINI.md` also imports `AGENTS.md` for Gemini CLI. The project skill path for Codex and Antigravity is shared, so one copy serves both. Claude Code uses its own project skill path. For global installation instead, use the client-specific user skill directories in their current documentation; project installation keeps the package reviewable with the target repository.
+```sh
+uv run ruff check sdd_engine tests
+uv run ruff format --check sdd_engine tests
+uv run mypy sdd_engine tests
+uv run pytest
+```
 
-Client documentation: [Codex skills](https://learn.chatgpt.com/docs/build-skills), [Claude Code skills](https://code.claude.com/docs/en/skills), [Claude Code instructions](https://code.claude.com/docs/en/memory), [Antigravity skills](https://antigravity.google/docs/skills), and [Antigravity rules](https://antigravity.google/docs/rules/).
+When modifying any active skill or shared template under `skills/`, mirror the changes to `/home/htxzz77/Projects/skills/` and verify there is no drift:
 
-## Use the SDD workflow
+```sh
+diff -ru skills/sdd-shared /home/htxzz77/Projects/skills/sdd-shared
+for d in sdd-{orchestrate,plan,implement,review}-{simple,saas,game} \
+  python-dev javascript-dev typescript-dev react-dev vue-dev \
+  rust-dev go-dev cpp-dev cpp-cv-dev cpp-aaa-dev database-dev; do
+  diff -ru "skills/$d" "/home/htxzz77/Projects/skills/$d"
+done
+```
 
-Choose one tier for the project, then use the relevant stage. A stage is a skill, not a permanent persona; agents load its instructions and templates when the work calls for them.
-
-| Stage | Simple script or compact app | Hosted SaaS or service | Large or AAA game |
-| --- | --- | --- | --- |
-| Establish durable project context | `sdd-orchestrate-simple` | `sdd-orchestrate-saas` | `sdd-orchestrate-game` |
-| Plan one change | `sdd-plan-simple` | `sdd-plan-saas` | `sdd-plan-game` |
-| Implement a task spec | `sdd-implement-simple` | `sdd-implement-saas` | `sdd-implement-game` |
-| Independently review | `sdd-review-simple` | `sdd-review-saas` | `sdd-review-game` |
-
-For example, in a SaaS project: “Use `sdd-orchestrate-saas` to establish the project, constitution, and domain definitions,” then “Use `sdd-plan-saas` to plan billing retries,” “Use `sdd-implement-saas` for that task spec,” and “Use `sdd-review-saas` to check the implementation.” Invoke a skill by name where the client supports it, or ask the agent to use that skill explicitly.
-
-The orchestrator asks only for unresolved durable decisions, including the project's logging policy. It writes a simple Markdown project definition for small code, or YAML project, constitution, and relevant domain definitions for SaaS and games. Unknown required YAML fields remain explicit and block adoption. Planning creates **one task spec per bounded change**, splitting broad requests into independently verifiable specs. Implementation makes local before and after commits for each spec; review writes a focused counter-plan when it confirms a failed criterion or regression, or creates a local approval tag when verification passes. The project owner handles pushes and releases. Caipira carries decisions and prior work between clients, so a separate session handoff file is unnecessary.
-
-The coding guides in `docs/coding/` are defaults. Project configuration, supported versions, local conventions, and the user's instructions take priority. Agents should read only the guide for code they touch. The security baseline is a reference to adapt and verify against current provider and framework behavior, not a blanket rule to paste into every project.
-
-## Maintain the package
-
-- Edit active skills in `skills/` and their shared files in `skills/sdd-shared/templates/`. For this checkout, copy each change to `/home/htxzz77/Projects/skills/` and verify the corresponding files match. Keep other contents of that shared folder intact, and install the changed directories again in projects that use separate copies.
-- Keep `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` short. Put language details in `docs/coding/` and workflow details in skills.
-- When project decisions change, update the project definition or task spec and record the settled decision in Caipira with file evidence.
-- Keep Caipira data outside Git. Do not commit local memory databases, model files, client settings, or temporary reference checkouts to this package.
-
-## Verification
-
-After setup, check that each installed skill folder has a `SKILL.md`, `sdd-shared/templates/` is present beside it, and the client lists the chosen skill. Confirm the root instructions load in each client. Run Caipira `doctor`, then search for the same test term from each client while working in the same project root. A search in one client should find facts recorded in another after they are committed to Caipira.
-
-See [Caipira setup and behavior](docs/caipira.md) for the runtime dependency and per-client configuration files.
+See [`sdd_engine/README.md`](sdd_engine/README.md) for engine architecture and observability details, [`skills/sdd-shared/templates/engine-protocol.md`](skills/sdd-shared/templates/engine-protocol.md) for the implementer MCP protocol, and [`docs/caipira.md`](docs/caipira.md) for cross-agent memory setup.

@@ -1,6 +1,6 @@
 # Plan 05: Single-Graph Node Decomposition, Rollback Reconciliation, Hydration Order, and Run Cancellation
 
-Status: ready
+Status: done
 Project rules: AGENTS.md, docs/coding/common.md, docs/coding/python.md, skills/python-dev/SKILL.md
 Target files: sdd_engine/graph.py, sdd_engine/guidance.py, sdd_engine/service.py, sdd_engine/mcp_server.py, sdd_engine/cli.py, sdd_engine/models.py, pyproject.toml, tests/test_graph.py
 Depends on: 01-limits-paths-and-errors.md, 03-store-and-worktree-isolation.md, 04-spec-and-submission-contracts.md
