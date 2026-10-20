@@ -4,14 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from sdd_engine.artifacts import ArtifactError, ArtifactStore, WorkspaceRegistry
 from sdd_engine.models import (
-    MAX_FAILURE_REPORT_BYTES,
     ArtifactRef,
-    GenerationOutput,
     GenerationPrompt,
     GraphState,
     Target,
@@ -38,10 +33,6 @@ TARGET_SKILLS: dict[Target, tuple[str, ...]] = {
     Target.VUE_JAVASCRIPT: ("javascript-dev", "vue-dev"),
     Target.VUE_TYPESCRIPT: ("typescript-dev", "vue-dev"),
 }
-
-
-class GenerationError(RuntimeError):
-    """Raised when a code generator fails before returning a contract candidate."""
 
 
 class PromptHydrator:
@@ -99,14 +90,10 @@ class PromptHydrator:
 
         validation_feedback = None
         if state.validation_feedback is not None:
-            validation_feedback = self._artifacts.get_text(
-                state.validation_feedback, MAX_FAILURE_REPORT_BYTES
-            )
+            validation_feedback = load_text(state.validation_feedback)
         generation_feedback = None
         if state.failure_report is not None and state.failure_report != state.validation_feedback:
-            generation_feedback = self._artifacts.get_text(
-                state.failure_report, MAX_FAILURE_REPORT_BYTES
-            )
+            generation_feedback = load_text(state.failure_report)
 
         return GenerationPrompt(
             run_id=state.run_id,
@@ -134,53 +121,3 @@ class PromptHydrator:
         if len(content.encode("utf-8")) > self._max_context_bytes:
             raise ArtifactError(f"skill {skill_name!r} exceeds the configured context limit")
         return content
-
-
-class StructuredCodeGenerator:
-    """LangChain model adapter that requires a Pydantic code-generation result."""
-
-    def __init__(self, model: BaseChatModel) -> None:
-        """Bind a chat model to the strict generation result schema."""
-        self._model = model.with_structured_output(GenerationOutput)
-
-    def generate(self, prompt: GenerationPrompt) -> GenerationOutput:
-        """Generate whole files under the declared artifact contract.
-
-        # Errors
-
-        Raises `ValueError` (including LangChain output-parser errors) or `ValidationError`
-        for a response that breaks the contract, and `GenerationError` for model or
-        provider failures.
-        """
-        system_text = (
-            "You are the code-writing step of an SDD implementation. Implement the task spec by "
-            "returning the complete content of every file you create or change; only paths in "
-            "allowed_target_files may be written, and files you omit stay as they are. Include "
-            "the tests the spec and skills call for: native checks, including the test suite, "
-            "run on the result, and a missing or failing suite fails the run. During a repair, "
-            "fix the diagnostics in validation_feedback and generation_feedback. The calling "
-            "agent handles git checkpoints, project memory, and review, so skip those skill "
-            "steps. Follow the supplied project skills and spec. Return the exact structured "
-            "contract requested. Documentation metadata must have # Arguments and # Errors "
-            "sections and must not contain code examples. Do not claim that code is compiled "
-            "or verified."
-        )
-        user_text = prompt.model_dump_json(indent=2)
-        try:
-            result = self._model.invoke(
-                [SystemMessage(content=system_text), HumanMessage(content=user_text)]
-            )
-        except ValueError:
-            raise
-        # Providers raise unrelated exception hierarchies; translate them at this port.
-        except Exception as error:
-            raise GenerationError(
-                f"code generation model failed: {type(error).__name__}: {error}"
-            ) from error
-        generated = GenerationOutput.model_validate(result)
-        undeclared = [
-            item.path for item in generated.files if item.path not in prompt.allowed_target_files
-        ]
-        if undeclared:
-            raise ValueError(f"generated files were not declared in the GraphInput: {undeclared}")
-        return generated

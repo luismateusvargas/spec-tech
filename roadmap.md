@@ -1,8 +1,8 @@
-Still open
+## Current status (2026-10-20)
 
-- Low:
-  - Hydration doesn't count everything toward its size limit (feedback text; existing target files now count).
-  - An empty error_handling_mapping is accepted.
+The agent-neutral engine roadmap below is implemented. The engine pauses for an implementer submission and makes no model calls. The MCP and CLI entry points, per-project SQLite store, scope report, broad failed-run rollback, review skill guidance, and pinned Python/Rust/Go toolchain definitions are in place. Feedback text now counts toward the hydration limit, and an empty error handling mapping is rejected.
+
+The three toolchain images were built locally from digest-pinned bases. A rootless Docker smoke run validated a two-file Python task with Ruff and pytest. Rust and Go image commands were checked; complete Rust and Go project runs still depend on supplying project dependencies offline.
 
 ## Checkpoint (2026-10-20)
 
@@ -48,7 +48,7 @@ Still open
 - Also: shared `SafeRelativePath` / `TargetFiles` types (removes the duplicated path validator and bounds `GraphState.target_files` items); `read_text` OSErrors become `hydration` failures.
 - Tests: 98 passing, also with `LANGGRAPH_STRICT_MSGPACK=true`. Not yet run in real containers: the Python, Node, Rust, and C++ profiles (no images pulled).
 
-### Next: agent-neutral engine (designed 2026-10-20, not started)
+### Agent-neutral engine (implemented 2026-10-20)
 Decisions (user):
 - The engine never calls a model. The planner agent picks the implementer model during planning (for example Opus plans and dispatches a Sonnet 5.5 high-reasoning subagent). That subagent drives the engine and its checks run in the Docker sandbox built today. The planned model is recorded with the run.
 - Every agent (Claude Code, Codex, Antigravity, Sota) uses one MCP entry point. Sota already has an MCP client (`sota_infra/src/mcp_client.rs`).
@@ -62,5 +62,5 @@ Build order:
 4. Scope check: record a git tree of the worktree at begin and at finish, built with a temporary index so untracked and uncommitted files are included and the agent's index is untouched, then diff the two. Labels: declared, undeclared (outside `submit` or outside `target_files`), flagged (test files deleted or changed outside the plan; new skip/ignore markers; new suppressions such as noqa, type: ignore, eslint-disable; check-config edits). Store the scope report in SQLite. Broader rollback: on failure, restore every path changed since the starting tree, refusing if HEAD moved during the task.
 5. Update `sdd-review-*` skills to consume the scope report; mirror the change to `/home/htxzz77/Projects/skills` per AGENTS.md.
 
-### After that
-- Pinned toolchain images (Dockerfiles with dependencies baked in for `--network=none`). Toolchain priority is still to be chosen; suggested Python, Rust, Go.
+### Toolchain images
+- Pinned Python, Rust, and Go Dockerfiles are in `toolchains/`. The Python image includes Ruff, mypy, and pytest; the Rust image includes Clippy. Build commands and offline dependency limits are documented in `toolchains/README.md`.

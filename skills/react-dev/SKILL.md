@@ -59,7 +59,7 @@ Use this skill for React components, Hooks, and React rendering behavior. Apply 
 
 ## Tests, docs, and checks
 
-- Follow the colocated test structure required by `javascript-dev` or `typescript-dev`. Test rendered behavior through user-visible roles, labels, text, and interactions rather than component internals or Hook implementation details.
+- Follow the test layout required by the project and `javascript-dev` or `typescript-dev`. Test rendered behavior through user-visible roles, labels, text, and interactions rather than component internals or Hook implementation details.
 - Cover loading, empty, success, validation, error, retry, cancellation, keyboard interaction, and state transitions that matter to the component. Use the configured testing library and avoid snapshots as the only behavior check.
 - Document exported components, Hooks, props, and non-obvious behavior using the language skill's JSDoc or TSDoc conventions.
 - Run the configured formatter, linter, component tests, and JavaScript checks or TypeScript type checks. Keep the React Hooks lint rules enabled and treat warnings as blocking.

@@ -79,7 +79,7 @@ StatusValue = Annotated[RunStatus, Field(strict=False)]
 def _require_safe_relative_path(value: str) -> str:
     """Reject absolute paths, parent traversal, backslashes, and paths naming no file."""
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "\\" in value:
+    if path.is_absolute() or ".." in path.parts or "\\" in value or ".git" in path.parts:
         raise ValueError("path must be a safe relative POSIX path")
     if not path.parts:
         raise ValueError("path must identify a file")
@@ -188,6 +188,16 @@ class GenerationOutput(StrictModel):
     documentation_metadata: Annotated[str, Field(min_length=1)]
     error_handling_mapping: JsonTuple[ErrorHandlingMapping]
 
+    @field_validator("error_handling_mapping")
+    @classmethod
+    def require_error_mapping(
+        cls, value: tuple[ErrorHandlingMapping, ...]
+    ) -> tuple[ErrorHandlingMapping, ...]:
+        """Require an explicit account of at least one failure treatment."""
+        if not value:
+            raise ValueError("error_handling_mapping must contain at least one entry")
+        return value
+
     @field_validator("files")
     @classmethod
     def require_unique_files(cls, value: tuple[WorkspaceFile, ...]) -> tuple[WorkspaceFile, ...]:
@@ -199,8 +209,15 @@ class GenerationOutput(StrictModel):
     @classmethod
     def require_documentation_sections(cls, value: str) -> str:
         """Require argument and error documentation without embedded examples."""
-        if "# Arguments" not in value or "# Errors" not in value:
-            raise ValueError("documentation_metadata must contain # Arguments and # Errors")
+        has_arguments = "# Arguments" in value or "Args:" in value or "@param" in value
+        has_errors = (
+            "# Errors" in value or "Raises:" in value or "@throws" in value or "@returns" in value
+        )
+        if not has_arguments or not has_errors:
+            raise ValueError(
+                "documentation_metadata must contain # Arguments and # Errors "
+                "(or Args:/Raises: or @param/@throws)"
+            )
         if "```" in value:
             raise ValueError("documentation_metadata must not contain inline code examples")
         return value

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from sdd_engine.artifacts import (
@@ -18,7 +19,7 @@ from sdd_engine.artifacts import (
     WorkspaceBusyError,
     WorkspaceRegistry,
 )
-from sdd_engine.guidance import GenerationError, PromptHydrator
+from sdd_engine.guidance import PromptHydrator
 from sdd_engine.models import (
     ArtifactRef,
     FailureReport,
@@ -61,19 +62,6 @@ def checkpoint_serializer() -> JsonPlusSerializer:
     )
 
 
-class CodeGenerator(Protocol):
-    """Application port implemented by a structured-output language model."""
-
-    def generate(self, prompt: GenerationPrompt) -> GenerationOutput:
-        """Return whole approved files under the strict generation contract.
-
-        # Errors
-
-        Raises `ValueError` or `ValidationError` for a contract violation and
-        `GenerationError` for a model or provider failure; both are retried within budget.
-        """
-
-
 @dataclass(frozen=True)
 class EngineDependencies:
     """Infrastructure dependencies shared by language-specialist subgraphs."""
@@ -81,7 +69,6 @@ class EngineDependencies:
     artifacts: ArtifactStore
     workspaces: WorkspaceRegistry
     prompts: PromptHydrator
-    generator: CodeGenerator
     validator: NativeValidator
     max_generation_attempts: int = 3
     max_validation_attempts: int = 3
@@ -137,36 +124,36 @@ class SddEngine:
         self._graph = graph
         self._dependencies = dependencies
 
-    def invoke(self, request: GraphInput) -> GraphState:
-        """Run a strict request under the workspace lock and validate the final state.
-
-        A run that cannot take the lock ends as `failed` without touching the workspace.
-        """
+    def begin(self, request: GraphInput) -> dict[str, object]:
+        """Start a run and return its first agent prompt or terminal state."""
         validated_request = GraphInput.model_validate(request)
         initial_state = GraphState.model_validate(validated_request.model_dump())
+        return self._step(initial_state, validated_request.workspace_id, validated_request.run_id)
+
+    def submit(self, run_id: str, workspace_id: str, response: object) -> dict[str, object]:
+        """Resume a paused run with the implementer's structured file submission."""
+        return self._step(Command(resume=response), workspace_id, run_id)
+
+    def _step(
+        self, value: GraphState | Command[Any], workspace_id: str, run_id: str
+    ) -> dict[str, object]:
+        """Advance the graph under a worktree lock and expose only prompt or state."""
         try:
-            with self._dependencies.workspaces.lock(validated_request.workspace_id):
+            with self._dependencies.workspaces.lock(workspace_id):
                 result = self._graph.invoke(
-                    initial_state,
-                    config={"configurable": {"thread_id": validated_request.run_id}},
+                    value,
+                    config={"configurable": {"thread_id": run_id}},
                 )
         except WorkspaceBusyError as error:
-            return self._fail_before_run(
-                initial_state, "workspace_busy", "Another run is using this workspace.", error
-            )
+            raise ArtifactError("another run is using this workspace") from error
         except ArtifactError as error:
-            # Only the lock raises here; graph nodes turn their own errors into reports.
-            return self._fail_before_run(
-                initial_state, "workspace_lock", "The workspace could not be locked.", error
-            )
-        return GraphState.model_validate(result)
-
-    def _fail_before_run(
-        self, state: GraphState, category: str, summary: str, error: Exception
-    ) -> GraphState:
-        failure = FailureReport(category=category, summary=summary, diagnostics=str(error))
-        failure_ref = self._dependencies.artifacts.put_model(failure)
-        return state.model_copy(update={"failure_report": failure_ref, "status": RunStatus.FAILED})
+            raise ArtifactError("the workspace could not be locked") from error
+        if "__interrupt__" in result:
+            values = result["__interrupt__"]
+            return {
+                "prompt": GenerationPrompt.model_validate(values[0].value).model_dump(mode="json")
+            }
+        return {"state": GraphState.model_validate(result).model_dump(mode="json")}
 
 
 def _build_specialist_subgraph(
@@ -250,8 +237,7 @@ def _build_specialist_subgraph(
             else RunStatus.FAILED
         )
         try:
-            result = dependencies.generator.generate(prompt)
-            generated = GenerationOutput.model_validate(result)
+            generated = GenerationOutput.model_validate(interrupt(prompt.model_dump(mode="json")))
             undeclared = [
                 item.path for item in generated.files if item.path not in state.target_files
             ]
@@ -270,18 +256,6 @@ def _build_specialist_subgraph(
                 status=retry_status,
             )
             return _validated_patch(state, patch)
-        except GenerationError as error:
-            failure_ref = record_failure(
-                "generation_error", "The code generation model failed to respond.", error
-            )
-            patch = GraphPatch(
-                generation_attempts=attempt,
-                generation_failures=failures,
-                failure_report=failure_ref,
-                status=retry_status,
-            )
-            return _validated_patch(state, patch)
-
         original_files = state.original_files
         try:
             for item in generated.files:

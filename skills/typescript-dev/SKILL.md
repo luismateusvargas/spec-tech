@@ -51,7 +51,7 @@ Use this skill for TypeScript source files and TypeScript-specific contracts. Fo
 
 ## Tests, documentation, and checks
 
-- Keep focused unit tests in the same source file as the implementation. If the test runner does not discover colocated tests by default, configure it to do so. Use the project's test runner and write tests in fixture/setup → actual → expected → assertion order.
+- Follow the project's existing test layout (`tests/` or `__tests__/` directories, sidecar `*.test.ts` / `*.spec.ts` files, or colocated unit tests when configured). Use the project's test runner and write tests in fixture/setup → actual → expected → assertion order.
 - Prefer assertions on complete typed objects or schemas over checking fields one by one. Keep fixtures generic and reusable, and test success, runtime validation failures, asynchronous errors, cancellation, and resource cleanup.
 - Add concise TSDoc to every exported module API, function, class, method, and public type. Document parameters, return values, and errors where applicable. Do not include usage examples in API doc comments.
 - Use `import type` for imports used only as types when supported by the project's module configuration. Preserve inference for local values and annotate public boundaries and complex returns where it clarifies the contract.

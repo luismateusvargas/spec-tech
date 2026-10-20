@@ -1,4 +1,4 @@
-"""Contract validation at the public, LLM, and checkpoint boundaries."""
+"""Contract validation at the public, implementer, and checkpoint boundaries."""
 
 from __future__ import annotations
 
@@ -56,6 +56,21 @@ def test_generation_output_accepts_parser_lists() -> None:
 
 
 @pytest.mark.parametrize(
+    "doc",
+    [
+        "# Arguments\nNone.\n\n# Errors\nNone.",
+        "Args:\n    x: int\n\nRaises:\n    ValueError: on bad input.",
+        "@param x The value\n@throws Error on failure",
+        "@param x The value\n@returns The result",
+    ],
+)
+def test_generation_output_accepts_language_native_doc_sections(doc: str) -> None:
+    output = GenerationOutput.model_validate(generation_args(documentation_metadata=doc))
+
+    assert output.documentation_metadata == doc
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"run_id": 7},
@@ -74,7 +89,9 @@ def test_graph_input_still_rejects_coercion_and_unknown_fields(
         GraphInput.model_validate(api_payload(**overrides))
 
 
-@pytest.mark.parametrize("path", ["/etc/passwd", "../outside.rs", "src/../../x.rs", "src\\lib.rs"])
+@pytest.mark.parametrize(
+    "path", ["/etc/passwd", "../outside.rs", "src/../../x.rs", "src\\lib.rs", ".git/config"]
+)
 def test_graph_input_rejects_unsafe_target_paths(path: str) -> None:
     with pytest.raises(ValidationError, match="safe relative POSIX path"):
         GraphInput.model_validate(api_payload(target_files=[path]))
@@ -93,6 +110,7 @@ def test_graph_input_rejects_duplicate_target_paths() -> None:
         ({"files": [{"path": "../escape.py", "content": "x"}]}, "safe relative POSIX path"),
         ({"files": [{"path": ".", "content": "x"}]}, "identify a file"),
         ({"files": []}, "1 to 128 unique paths"),
+        ({"error_handling_mapping": []}, "at least one entry"),
         (
             {"files": [{"path": "a.py", "content": "1"}, {"path": "a.py", "content": "2"}]},
             "1 to 128 unique paths",

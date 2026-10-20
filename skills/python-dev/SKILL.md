@@ -41,9 +41,9 @@ Use this skill for every task involving Python. Apply all rules here to Python w
 
 ## Tests, documentation, and checks
 
-- Keep focused unit tests in the same source file as the implementation. If the test runner does not discover colocated tests by default, configure it to do so. Use pytest and write each test in fixture/setup → actual → expected → assertion order. Prefer assertions on complete typed objects or schemas over checking fields one by one.
+- Follow the project's existing test layout (`tests/` directory, sidecar `test_*.py` / `*_test.py` files, or colocated unit tests when configured). Use pytest and write each test in fixture/setup → actual → expected → assertion order. Prefer assertions on complete typed objects or schemas over checking fields one by one.
 - Keep fixtures generic and reusable. Use descriptive names such as `fixture`, `actual`, and `expected`; keep test boilerplate small.
-- Add concise triple-quoted docstrings to every public module, function, class, and method. Document interfaces with `Args:`, `Returns:`, and `Raises:` sections as applicable. Do not include usage examples in docstrings.
+- Add concise triple-quoted docstrings to every public module, function, class, and method. Document parameters, return values, and raised errors clearly (for example with `Args:`, `Returns:`, `Raises:`, or `# Arguments` and `# Errors` sections, following the repository's convention). Do not include usage examples in docstrings.
 - Run tests and all configured checks for Python changes. Use Ruff for linting and formatting; warnings and style violations are blocking. Run either mypy or pyright in strict mode. Report checks that could not run.
 - Use context managers for files, locks, and transactions. Use `pathlib` for paths, structured logging for library and service code, and never log secrets. Avoid mutable default arguments and shared mutable class attributes for instance state.
 - In async code, do not block the event loop. Make task cancellation and cleanup explicit.

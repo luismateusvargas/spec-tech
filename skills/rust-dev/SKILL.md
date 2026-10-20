@@ -38,7 +38,7 @@ Use this skill whenever the task involves Rust. It is a reference for planning, 
 
 - Write tests in the same file as the source. Use `pretty_assertions::assert_eq`, fixtures, and the `fixture` / `actual` / `expected` pattern. Keep tests concise and fixtures generic and reusable. Prefer `new`, `Default`, and `derive_setters::Setters` to construct actual values, expected values, and fixtures; avoid struct literals and `with_*` constructors for those setups. Assert on complete objects when practical, use `assert_eq!` for equality and `assert!` for boolean conditions. Test functions may use `unwrap()`; fixture helpers should return `anyhow::Result`. Use `expect` instead of `panic!` when an invariant needs a useful message. Treat snapshot acceptance as a reviewable change.
 - Write concise `///` documentation for every public method, function, struct, enum, and trait. Include `# Arguments` and `# Errors` where applicable. Do not include code examples.
-- Always verify Rust changes with tests and linting. Run crate-specific tests with `cargo insta test --accept`, formatting, and Clippy. Clippy warnings are unacceptable. Do not run `cargo build --release` for routine verification; use `cargo check`, tests, or a debug build. Report checks that could not run.
+- Always verify Rust changes with tests and linting. Run crate-specific tests with `cargo test` (or `cargo insta test --accept` when the crate uses `insta` snapshots), formatting, and Clippy. Clippy warnings are unacceptable. Do not run `cargo build --release` for routine verification; use `cargo check`, tests, or a debug build. Report checks that could not run.
 
 ## Services and domain types
 

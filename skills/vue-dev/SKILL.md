@@ -59,7 +59,7 @@ Use this skill for Vue components, composables, and Vue rendering behavior. Appl
 
 ## Tests, docs, and checks
 
-- Follow the colocated test structure required by `javascript-dev` or `typescript-dev`. Test rendered behavior through accessible roles, labels, text, and user interactions rather than component internals or implementation-specific reactive details.
+- Follow the test layout required by the project and `javascript-dev` or `typescript-dev`. Test rendered behavior through accessible roles, labels, text, and user interactions rather than component internals or implementation-specific reactive details.
 - Cover loading, empty, success, validation, error, retry, cancellation, keyboard interaction, and state transitions relevant to the component. Use the configured Vue testing tools; avoid snapshots as the only behavior check.
 - Document exported components, composables, props, events, and non-obvious behavior using the language skill's JSDoc or TSDoc conventions.
 - Run the configured formatter, linter, component tests, and JavaScript checks or TypeScript/Vue type checks. Keep framework-specific lint rules enabled and treat warnings as blocking.

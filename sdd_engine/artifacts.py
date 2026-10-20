@@ -277,7 +277,12 @@ class WorkspaceRegistry:
         """Resolve a safe relative path and reject symlink escapes."""
         root = self.get(workspace_id)
         posix_path = PurePosixPath(relative_path)
-        if posix_path.is_absolute() or ".." in posix_path.parts or "\\" in relative_path:
+        if (
+            posix_path.is_absolute()
+            or ".." in posix_path.parts
+            or ".git" in posix_path.parts
+            or "\\" in relative_path
+        ):
             raise ArtifactError("workspace file paths must be relative and cannot traverse parents")
         path = root.joinpath(*posix_path.parts)
         if not path.resolve(strict=False).is_relative_to(root):

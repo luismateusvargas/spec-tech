@@ -1,429 +1,265 @@
-"""End-to-end routing, retry, and failure-reporting behavior of the compiled engine."""
+"""Agent handoff, durable state, scope reporting, and failure restoration."""
 
 from __future__ import annotations
 
-import json
-import logging
+import subprocess
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
-from conftest import (
-    PROJECT_ROOT,
-    TARGET_FILE,
-    WORKSPACE_ID,
-    Harness,
-    ScriptedRunner,
-    generation_args,
-    llm_generator,
+from conftest import TARGET_FILE, generation_args
+
+from sdd_engine.artifacts import ArtifactError
+from sdd_engine.models import CommandResult, GraphInput, RunStatus
+from sdd_engine.service import (
+    begin_task,
+    configure_profile,
+    finish_task,
+    get_run_report,
+    submit,
 )
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-
-from sdd_engine.graph import checkpoint_serializer
-from sdd_engine.models import (
-    ArtifactRef,
-    CommandResult,
-    FailureReport,
-    GenerationOutput,
-    GraphState,
-    RunStatus,
-    ValidationReport,
-)
-from sdd_engine.validation import ValidationInfrastructureError
+from sdd_engine.store import ProjectStore, project_database
+from sdd_engine.validation import CommandSpec, ValidationProfile
 
 
-def unapproved_file_args() -> dict[str, object]:
-    return generation_args(files=[{"path": "other.py", "content": "x"}])
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(("git", "-C", str(root), *args), check=True, capture_output=True)
 
 
-def failure_of(harness: Harness, state: GraphState) -> FailureReport:
-    assert state.failure_report is not None
-    return harness.store.get_model(state.failure_report, FailureReport, 1_000_000)
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Create a disposable Git worktree and a passing isolated check runner."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(
+        root,
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "initial",
+    )
+    profile = ValidationProfile(
+        image="busybox:1.37", commands=(CommandSpec(name="check", argv=("true",)),)
+    )
+    configure_profile(str(root), "python", profile.model_dump(mode="json"))
+
+    def pass_check(
+        self: object, command: CommandSpec, workspace: Path, profile: ValidationProfile
+    ) -> CommandResult:
+        return CommandResult(command_name=command.name, exit_code=0)
+
+    monkeypatch.setattr("sdd_engine.validation.DockerCommandRunner.run", pass_check)
+    return root
 
 
-def test_structured_llm_output_is_written_and_validated(harness: Harness) -> None:
-    generator, model = llm_generator(generation_args())
-    runner = ScriptedRunner()
+def _begin(root: Path) -> dict[str, object]:
+    return begin_task(
+        str(root), "Expose VALUE = 1.", "simple", "python", [TARGET_FILE], "planned-model"
+    )
 
-    state = harness.build(generator, runner).invoke(harness.request)
 
-    assert state.status is RunStatus.VALIDATED
-    assert (state.generation_attempts, state.validation_attempts) == (1, 1)
-    assert state.failure_report is None
-    assert (harness.workspace / TARGET_FILE).read_text(encoding="utf-8") == "VALUE = 1\n"
-    assert runner.calls == ["ruff-check", "mypy-strict"]
-    assert state.generated_artifact is not None
-    stored = harness.store.get_model(state.generated_artifact, GenerationOutput, 1_000_000)
-    assert stored.error_handling_mapping[0].domain_exception == "StorageError"
-    skills = [
-        (PROJECT_ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
-        for name in ("sdd-implement-simple", "python-dev")
+def test_begin_pauses_and_persists_prompt(project: Path) -> None:
+    result = _begin(project)
+    prompt = result["prompt"]
+    assert isinstance(prompt, dict)
+    assert prompt["specification_text"] == "Expose VALUE = 1."
+    assert prompt["allowed_target_files"] == [TARGET_FILE]
+    report = cast(dict[str, Any], get_run_report(str(project), str(result["run_id"])))
+    assert report["model"] == "planned-model"
+    assert report["phase"] == "pending"
+    assert report["prompt"] == prompt
+    assert project_database(project) == project / ".git" / "spec-tech" / "engine.db"
+
+
+def test_submit_validates_and_finish_records_declared_change(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    result = cast(dict[str, Any], submit(str(project), run_id, generation_args()))
+    assert result["state"]["status"] == RunStatus.VALIDATED.value
+    assert (project / TARGET_FILE).read_text(encoding="utf-8") == "VALUE = 1\n"
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    assert report["scope_report"]["changes"] == [
+        {"path": TARGET_FILE, "label": "declared", "flags": []}
     ]
-    assert json.loads(model.prompts[0])["engineering_guidance"] == skills
+    assert report["validation_report"]["passed"] is True
+    store = ProjectStore(project_database(project))
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] > 0
 
 
-def test_contract_failure_is_retried_then_succeeds(harness: Harness) -> None:
-    generator, model = llm_generator(
-        generation_args(documentation_metadata="missing sections"), generation_args()
+def test_bad_submission_retries_with_contract_feedback(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    first = cast(
+        dict[str, Any],
+        submit(str(project), run_id, generation_args(documentation_metadata="missing")),
     )
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert state.generation_attempts == 2
-    repair_prompt = json.loads(model.prompts[1])
-    assert "# Arguments and # Errors" in repair_prompt["generation_feedback"]
-    assert repair_prompt["validation_feedback"] is None
+    assert "# Arguments and # Errors" in first["prompt"]["generation_feedback"]
+    second = cast(dict[str, Any], submit(str(project), run_id, generation_args()))
+    assert second["state"]["status"] == RunStatus.VALIDATED.value
+    assert second["state"]["generation_attempts"] == 2
 
 
-def test_unapproved_target_file_exhausts_generation_budget(harness: Harness) -> None:
-    generator, _ = llm_generator(*(unapproved_file_args() for _ in range(3)))
-    runner = ScriptedRunner()
+def test_failed_run_restores_agent_edits(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_check(
+        self: object, command: CommandSpec, workspace: Path, profile: ValidationProfile
+    ) -> CommandResult:
+        return CommandResult(command_name=command.name, exit_code=1)
 
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.generation_attempts == 3
-    assert failure_of(harness, state).category == "generation_contract"
-    assert not (harness.workspace / "other.py").exists()
-    assert runner.calls == []
-
-
-def test_provider_error_is_reported_and_retried(harness: Harness) -> None:
-    generator, _ = llm_generator(ConnectionError("upstream reset"), generation_args())
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert state.generation_attempts == 2
-
-
-def test_persistent_provider_error_fails_with_report(harness: Harness) -> None:
-    generator, _ = llm_generator(*(TimeoutError("rate limited") for _ in range(3)))
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    failure = failure_of(harness, state)
-    assert failure.category == "generation_error"
-    assert "TimeoutError: rate limited" in failure.diagnostics
+    monkeypatch.setattr("sdd_engine.validation.DockerCommandRunner.run", fail_check)
+    run_id = str(_begin(project)["run_id"])
+    (project / "rogue.py").write_text("# noqa\n", encoding="utf-8")
+    for _ in range(3):
+        result = cast(dict[str, Any], submit(str(project), run_id, generation_args()))
+    assert result["state"]["status"] == RunStatus.FAILED.value
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    assert report["scope_report"]["restored"] is True
+    assert report["scope_report"]["changes"] == [
+        {"path": "rogue.py", "label": "undeclared", "flags": ["suppression_added"]}
+    ]
+    assert not (project / "rogue.py").exists()
+    assert not (project / TARGET_FILE).exists()
 
 
-def test_native_failure_feeds_diagnostics_into_repair(harness: Harness) -> None:
-    generator, model = llm_generator(generation_args(), generation_args())
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="F401 unused import os")]
+def test_head_move_refuses_broader_rollback(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_check(
+        self: object, command: CommandSpec, workspace: Path, profile: ValidationProfile
+    ) -> CommandResult:
+        return CommandResult(command_name=command.name, exit_code=1)
+
+    monkeypatch.setattr("sdd_engine.validation.DockerCommandRunner.run", fail_check)
+    run_id = str(_begin(project)["run_id"])
+    (project / "rogue.py").write_text("x\n", encoding="utf-8")
+    for _ in range(3):
+        submit(str(project), run_id, generation_args())
+    _git(
+        project,
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "moved",
     )
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert (state.generation_attempts, state.validation_attempts) == (2, 2)
-    repair_prompt = json.loads(model.prompts[1])
-    assert "F401 unused import os" in repair_prompt["validation_feedback"]
-    assert repair_prompt["existing_files"] == [{"path": TARGET_FILE, "content": "VALUE = 1\n"}]
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    assert report["scope_report"]["head_changed"] is True
+    assert report["scope_report"]["restored"] is False
+    assert (project / "rogue.py").exists()
 
 
-def test_native_failures_exhaust_validation_budget(harness: Harness) -> None:
-    generator, _ = llm_generator(*(generation_args() for _ in range(3)))
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="E501") for _ in range(3)]
+def test_profile_history_and_git_target_rejection(project: Path) -> None:
+    profile = ValidationProfile(
+        image="busybox:1.37", commands=(CommandSpec(name="check", argv=("true",)),)
     )
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.validation_attempts == 3
-    assert failure_of(harness, state).category == "native_validation"
-    assert state.validation_report is not None
-    report = harness.store.get_model(state.validation_report, ValidationReport, 1_000_000)
-    assert not report.passed
-
-
-def test_large_non_ascii_diagnostics_reach_the_repair_prompt(harness: Harness) -> None:
-    # Regression: a JSON-encoded report above 32,000 bytes crashed the repair hydration.
-    generator, model = llm_generator(generation_args(), generation_args())
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="─" * 15_000)]
-    )
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert "─" * 100 in json.loads(model.prompts[1])["validation_feedback"]
-
-
-def test_validation_infrastructure_error_fails_without_repair(harness: Harness) -> None:
-    generator, model = llm_generator(generation_args())
-    runner = ScriptedRunner([ValidationInfrastructureError("image not found")])
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.validation_attempts == 0
-    assert len(model.prompts) == 1
-    failure = failure_of(harness, state)
-    assert failure.category == "validation_infrastructure"
-    assert "image not found" in failure.diagnostics
-
-
-def test_missing_validation_profile_fails_with_report(harness: Harness) -> None:
-    generator, _ = llm_generator(generation_args())
-
-    state = harness.build(generator, profiles={}).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert failure_of(harness, state).category == "validation_infrastructure"
-
-
-def test_missing_specification_fails_hydration_without_generating(harness: Harness) -> None:
-    generator, model = llm_generator(generation_args())
-    request = harness.request.model_copy(
-        update={
-            "specification": harness.request.specification.model_copy(update={"digest": "0" * 64})
-        }
-    )
-
-    state = harness.build(generator).invoke(request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.generation_attempts == 0
-    assert model.prompts == []
-    assert failure_of(harness, state).category == "hydration"
-
-
-def test_workspace_write_failure_fails_with_report(harness: Harness) -> None:
-    # A read-only parent directory makes the atomic write fail.
-    parent = (harness.workspace / TARGET_FILE).parent
-    parent.mkdir()
-    parent.chmod(0o500)
-    generator, _ = llm_generator(generation_args())
-
-    try:
-        state = harness.build(generator).invoke(harness.request)
-    finally:
-        parent.chmod(0o700)
-
-    assert state.status is RunStatus.FAILED
-    assert failure_of(harness, state).category == "workspace_write"
-
-
-def test_unreadable_target_path_fails_hydration(harness: Harness) -> None:
-    (harness.workspace / TARGET_FILE).mkdir(parents=True)
-    generator, model = llm_generator(generation_args())
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert failure_of(harness, state).category == "hydration"
-    assert model.prompts == []
-
-
-def test_one_generation_writes_several_files(harness: Harness) -> None:
-    request = harness.request.model_copy(update={"target_files": (TARGET_FILE, "tests/test_x.py")})
-    generator, model = llm_generator(
-        generation_args(
-            files=[
-                {"path": TARGET_FILE, "content": "VALUE = 1\n"},
-                {"path": "tests/test_x.py", "content": "def test_value() -> None: ...\n"},
-            ]
+    result = configure_profile(str(project), "python", profile.model_dump(mode="json"))
+    assert result["revision"] == 2
+    with ProjectStore(project_database(project)).connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM profile_history").fetchone()[0] == 2
+    with pytest.raises(ValueError):
+        GraphInput.model_validate(
+            {
+                "run_id": "r",
+                "workspace_id": "w",
+                "target": "python",
+                "tier": "simple",
+                "specification": {"digest": "0" * 64, "byte_length": 0, "media_type": "text/plain"},
+                "target_files": [".git/config"],
+            }
         )
+
+
+def test_finish_rejects_pending_run(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    with pytest.raises(ArtifactError, match="awaiting"):
+        finish_task(str(project), run_id)
+
+
+def test_second_run_on_the_same_worktree_waits_for_finish(project: Path) -> None:
+    first = _begin(project)
+    with pytest.raises(ArtifactError, match="unfinished"):
+        _begin(project)
+    submit(str(project), str(first["run_id"]), generation_args())
+    finish_task(str(project), str(first["run_id"]))
+    assert "prompt" in _begin(project)
+
+
+def test_worktrees_share_the_project_database(project: Path) -> None:
+    sibling = project.parent / "sibling"
+    _git(project, "worktree", "add", "--detach", str(sibling))
+    assert project_database(sibling) == project_database(project)
+
+
+def test_ignore_edit_does_not_hide_a_starting_untracked_file(project: Path) -> None:
+    (project / "notes.txt").write_text("starting notes\n", encoding="utf-8")
+    run_id = str(_begin(project)["run_id"])
+    (project / ".gitignore").write_text("notes.txt\n", encoding="utf-8")
+    submit(str(project), run_id, generation_args())
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    paths = {item["path"] for item in report["scope_report"]["changes"]}
+    assert paths == {".gitignore", TARGET_FILE}
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "starting notes\n"
+
+
+def test_deleted_test_file_is_flagged_for_review(project: Path) -> None:
+    old_test = project / "tests" / "test_old.py"
+    old_test.parent.mkdir()
+    old_test.write_text("def test_old() -> None: pass\n", encoding="utf-8")
+    run_id = str(_begin(project)["run_id"])
+    old_test.unlink()
+    submit(str(project), run_id, generation_args())
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    findings = {item["path"]: item for item in report["scope_report"]["changes"]}
+    assert findings["tests/test_old.py"] == {
+        "path": "tests/test_old.py",
+        "label": "undeclared",
+        "flags": ["test_deleted"],
+    }
+
+
+def test_begin_rejects_blocked_task_spec(project: Path) -> None:
+    blocked_spec = "# Task\n\nStatus: blocked\n\n## Outcome\nWait for decision.\n"
+    with pytest.raises(ValueError, match="Status: blocked"):
+        begin_task(str(project), blocked_spec, "simple", "python", [TARGET_FILE], "planned-model")
+
+
+def test_scope_flags_go_rust_cpp_and_spec_files(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    (project / "pkg_test.go").write_text(
+        "package p\nfunc TestX(t *testing.T) { t.Skip() }\n", encoding="utf-8"
     )
-
-    state = harness.build(generator).invoke(request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert (harness.workspace / "tests" / "test_x.py").is_file()
-    assert [original.path for original in state.original_files] == [TARGET_FILE, "tests/test_x.py"]
-    assert json.loads(model.prompts[0])["allowed_target_files"] == [TARGET_FILE, "tests/test_x.py"]
-
-
-def test_first_prompt_shows_existing_target_files(harness: Harness) -> None:
-    target = harness.workspace / TARGET_FILE
-    target.parent.mkdir(parents=True)
-    target.write_text("ORIGINAL = 0\n", encoding="utf-8")
-    generator, model = llm_generator(generation_args())
-
-    harness.build(generator).invoke(harness.request)
-
-    existing = json.loads(model.prompts[0])["existing_files"]
-    assert existing == [{"path": TARGET_FILE, "content": "ORIGINAL = 0\n"}]
+    (project / "ui.spec.ts").write_text("test.skip('later', () => {})\n", encoding="utf-8")
+    (project / "lib.rs").write_text("#[allow(dead_code)]\n#[ignore]\nfn f() {}\n", encoding="utf-8")
+    (project / "engine.cpp").write_text("// NOLINT\nvoid t() { GTEST_SKIP(); }\n", encoding="utf-8")
+    submit(str(project), run_id, generation_args())
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    findings = {item["path"]: item["flags"] for item in report["scope_report"]["changes"]}
+    assert findings["pkg_test.go"] == ["test_changed_outside_plan", "skip_added"]
+    assert findings["ui.spec.ts"] == ["test_changed_outside_plan", "skip_added"]
+    assert findings["lib.rs"] == ["suppression_added", "skip_added"]
+    assert findings["engine.cpp"] == ["suppression_added", "skip_added"]
 
 
-def test_failed_multi_file_run_restores_every_file(harness: Harness) -> None:
-    request = harness.request.model_copy(update={"target_files": (TARGET_FILE, "README.md")})
-    (harness.workspace / "README.md").write_text("docs\n", encoding="utf-8")
-    files = [
-        {"path": TARGET_FILE, "content": "VALUE = 1\n"},
-        {"path": "README.md", "content": "changed\n"},
-    ]
-    generator, _ = llm_generator(*(generation_args(files=files) for _ in range(3)))
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1) for _ in range(3)]
-    )
-
-    state = harness.build(generator, runner).invoke(request)
-
-    assert state.workspace_restored
-    assert (harness.workspace / "README.md").read_text(encoding="utf-8") == "docs\n"
-    assert sorted(path.name for path in harness.workspace.iterdir()) == ["README.md"]
-
-
-def test_checkpointed_run_round_trips_state(harness: Harness) -> None:
-    generator, _ = llm_generator(generation_args(), generation_args())
-    runner = ScriptedRunner([CommandResult(command_name="ruff-check", exit_code=1)])
-
-    state = harness.build(generator, runner, checkpointer=InMemorySaver()).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert state.validation_attempts == 2
-
-
-def test_contract_failure_during_repair_has_its_own_budget(harness: Harness) -> None:
-    # Two failed checks used to spend the shared budget, so one contract failure ended the run.
-    broken = generation_args(documentation_metadata="missing sections")
-    generator, _ = llm_generator(
-        generation_args(), broken, generation_args(), broken, generation_args()
-    )
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="E501") for _ in range(2)]
-    )
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert (state.generation_attempts, state.generation_failures) == (5, 0)
-    assert state.validation_attempts == 3
-
-
-def test_generation_budget_applies_per_round(harness: Harness) -> None:
-    broken = generation_args(documentation_metadata="missing sections")
-    generator, _ = llm_generator(generation_args(), broken, broken, broken)
-    runner = ScriptedRunner([CommandResult(command_name="ruff-check", exit_code=1)])
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert (state.generation_attempts, state.generation_failures) == (4, 3)
-    assert failure_of(harness, state).category == "generation_contract"
-
-
-def test_compiler_diagnostics_survive_a_contract_failure_during_repair(
-    harness: Harness,
+def test_failed_run_prunes_empty_untracked_directories(
+    project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    broken = generation_args(documentation_metadata="missing sections")
-    generator, model = llm_generator(generation_args(), broken, generation_args())
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="F401 unused import os")]
-    )
+    def fail_check(
+        self: object, command: CommandSpec, workspace: Path, profile: ValidationProfile
+    ) -> CommandResult:
+        return CommandResult(command_name=command.name, exit_code=1)
 
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    retry_prompt = json.loads(model.prompts[2])
-    assert "F401 unused import os" in retry_prompt["validation_feedback"]
-    assert "# Arguments and # Errors" in retry_prompt["generation_feedback"]
-    assert state.validation_feedback is None
-
-
-@pytest.mark.parametrize(
-    "serde",
-    [checkpoint_serializer(), JsonPlusSerializer(allowed_msgpack_modules=None)],
-    ids=["engine-serializer", "strict-serializer"],
-)
-def test_checkpoints_restore_engine_types_without_warnings(
-    harness: Harness, caplog: pytest.LogCaptureFixture, serde: JsonPlusSerializer
-) -> None:
-    caplog.set_level(logging.WARNING)
-    generator, _ = llm_generator(generation_args(), generation_args())
-    runner = ScriptedRunner([CommandResult(command_name="ruff-check", exit_code=1)])
-    engine = harness.build(generator, runner, checkpointer=InMemorySaver(serde=serde))
-
-    engine.invoke(harness.request)
-    # Read through the compiled graph's saver, which carries the engine allowlist.
-    saver = engine._graph.checkpointer
-    assert isinstance(saver, InMemorySaver)
-    checkpoint = saver.get_tuple({"configurable": {"thread_id": harness.request.run_id}})
-
-    assert checkpoint is not None
-    values = checkpoint.checkpoint["channel_values"]
-    assert values["status"] is RunStatus.VALIDATED
-    assert isinstance(values["specification"], ArtifactRef)
-    assert not [record for record in caplog.records if "msgpack" in record.getMessage()]
-
-
-def test_failed_run_restores_an_existing_file(harness: Harness) -> None:
-    target = harness.workspace / TARGET_FILE
-    target.parent.mkdir(parents=True)
-    target.write_text("ORIGINAL = 0\n", encoding="utf-8")
-    generator, _ = llm_generator(*(generation_args() for _ in range(3)))
-    runner = ScriptedRunner(
-        [CommandResult(command_name="ruff-check", exit_code=1, stdout="E501") for _ in range(3)]
-    )
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.workspace_restored
-    assert failure_of(harness, state).category == "native_validation"
-    assert target.read_text(encoding="utf-8") == "ORIGINAL = 0\n"
-
-
-def test_failed_run_removes_a_new_file_and_its_directories(harness: Harness) -> None:
-    generator, _ = llm_generator(generation_args())
-    runner = ScriptedRunner([ValidationInfrastructureError("image not found")])
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.workspace_restored
-    assert list(harness.workspace.iterdir()) == []
-
-
-def test_validated_run_keeps_its_changes(harness: Harness) -> None:
-    generator, _ = llm_generator(generation_args())
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.VALIDATED
-    assert not state.workspace_restored
-    assert [original.path for original in state.original_files] == [TARGET_FILE]
-    assert (harness.workspace / TARGET_FILE).read_text(encoding="utf-8") == "VALUE = 1\n"
-
-
-def test_failed_run_without_writes_skips_rollback(harness: Harness) -> None:
-    generator, _ = llm_generator(*(unapproved_file_args() for _ in range(3)))
-
-    state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert state.original_files == ()
-    assert not state.workspace_restored
-
-
-def test_rollback_failure_is_reported(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken_restore(*args: object) -> None:
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(harness.registry, "restore", broken_restore)
-    generator, _ = llm_generator(generation_args())
-    runner = ScriptedRunner([ValidationInfrastructureError("image not found")])
-
-    state = harness.build(generator, runner).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert not state.workspace_restored
-    failure = failure_of(harness, state)
-    assert failure.category == "rollback"
-    assert "read-only file system" in failure.diagnostics
-
-
-def test_busy_workspace_fails_without_running(harness: Harness) -> None:
-    generator, model = llm_generator(generation_args())
-
-    with harness.registry.lock(WORKSPACE_ID):
-        state = harness.build(generator).invoke(harness.request)
-
-    assert state.status is RunStatus.FAILED
-    assert failure_of(harness, state).category == "workspace_busy"
-    assert model.prompts == []
-    assert not (harness.workspace / TARGET_FILE).exists()
+    monkeypatch.setattr("sdd_engine.validation.DockerCommandRunner.run", fail_check)
+    run_id = str(_begin(project)["run_id"])
+    nested = project / "untracked_dir" / "sub" / "rogue.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("x = 1\n", encoding="utf-8")
+    for _ in range(3):
+        submit(str(project), run_id, generation_args())
+    report = cast(dict[str, Any], finish_task(str(project), run_id))
+    assert report["scope_report"]["restored"] is True
+    assert not (project / "untracked_dir").exists()

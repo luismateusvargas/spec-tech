@@ -43,7 +43,7 @@ Use this skill for JavaScript files and JavaScript runtime behavior. For TypeScr
 
 ## Tests, documentation, and checks
 
-- Keep focused unit tests in the same source file as the implementation. If the test runner does not discover colocated tests by default, configure it to do so. Use the project's test runner and write tests in fixture/setup → actual → expected → assertion order.
+- Follow the project's existing test layout (`tests/` or `__tests__/` directories, sidecar `*.test.js` / `*.spec.js` files, or colocated unit tests when configured). Use the project's test runner and write tests in fixture/setup → actual → expected → assertion order.
 - Prefer assertions on complete objects or schemas over checking fields one by one. Keep fixtures generic and reusable, and test success, validation failures, asynchronous errors, cancellation, and resource cleanup.
 - Add concise JSDoc to every public module API, function, class, and method. Document parameter and return types with `@param` and `@returns`; describe expected failures where applicable. Define reusable structured shapes with `@typedef`. Do not include usage examples in API doc comments.
 - Use `const` by default, `let` only when reassignment is needed, and do not use `var` in new code. Use context managers or `try`/`finally` cleanup patterns for streams, timers, listeners, locks, and other resources.
