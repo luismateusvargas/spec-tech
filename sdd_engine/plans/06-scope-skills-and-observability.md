@@ -1,6 +1,6 @@
 # Plan 06: Scope Heuristics, Target Registry Consolidation, Structured Logging, and Skills Sync
 
-Status: ready
+Status: done
 Project rules: AGENTS.md, docs/coding/common.md, docs/coding/python.md, skills/python-dev/SKILL.md
 Target files: sdd_engine/scope.py, sdd_engine/targets.py, sdd_engine/guidance.py, sdd_engine/validation.py, sdd_engine/graph.py, sdd_engine/service.py, sdd_engine/README.md, skills/sdd-shared/templates/engine-protocol.md, skills/sdd-shared/templates/task.simple.template.md, skills/sdd-shared/templates/task.saas.template.md, skills/sdd-shared/templates/task.game.template.md, skills/sdd-shared/templates/task.spec.template.md, skills/sdd-implement-simple/SKILL.md, skills/sdd-implement-saas/SKILL.md, skills/sdd-implement-game/SKILL.md, skills/sdd-plan-simple/SKILL.md, skills/sdd-plan-saas/SKILL.md, skills/sdd-plan-game/SKILL.md, tests/test_validation.py, tests/test_graph.py
 Depends on: 01-limits-paths-and-errors.md, 02-sandbox-and-profile-hardening.md, 03-store-and-worktree-isolation.md, 04-spec-and-submission-contracts.md, 05-graph-flow-and-lifecycle.md

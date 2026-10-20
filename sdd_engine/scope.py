@@ -15,19 +15,27 @@ from sdd_engine.limits import MAX_CONTEXT_BYTES
 from sdd_engine.paths import canonical_relative_path, resolve_workspace_path
 
 _SUPPRESSION = re.compile(
-    r"(?:noqa\b|type:\s*ignore\b|eslint-disable\b|@ts-ignore\b|pragma:\s*no cover\b|"
-    r"#\[allow\(|NOLINT\b)"
+    r"(?:noqa\b|type:\s*ignore\b|pyright:\s*ignore\b|pylint:\s*disable\b|eslint-disable\b|"
+    r"@ts-(?:ignore|expect-error|nocheck)\b|pragma:\s*no cover\b|#!?\[(?:allow|expect)\(|"
+    r"//\s*nolint\b|NOLINT(?:NEXTLINE|BEGIN)?\b)"
 )
+# `pytest.mark.skip` also matches `skipif`. GTest disables a suite or case by its name prefix.
 _SKIP = re.compile(
-    r"(?:pytest\.mark\.skip|\bskip\s*\(|\bignore\s*\(|\btest\.skip\s*\(|"
-    r"#\[ignore\b|\bt\.Skip(?:Now|f)?\s*\(|\bGTEST_SKIP\s*\()"
+    r"(?:pytest\.mark\.(?:skip|xfail)|\bskip(?:If|Unless|Test)?\s*\(|\bignore\s*\(|"
+    r"\b(?:x?it|x?describe|test)\.(?:skip|todo)\s*\(|\bx(?:it|describe|test)\s*\(|"
+    r"#\[ignore\b|\bt\.Skip(?:Now|f)?\s*\(|\bGTEST_SKIP\s*\(|[(,]\s*DISABLED_\w)"
 )
 _TEST_PATH = re.compile(
-    r"(?:^|/)(?:tests?|__tests__)/|(?:^|/)test_[^/]+|(?:_test|\.(?:test|spec))\.[^/]+$"
+    r"(?:^|/)(?:tests?|__tests__)/|(?:^|/)(?:conftest\.py$|test_[^/]+)"
+    r"|(?:_test|\.(?:test|spec))\.[^/]+$"
 )
 _CHECK_CONFIG = re.compile(
-    r"(?:^|/)(?:\.gitignore|pyproject\.toml|pytest\.ini|mypy\.ini|ruff\.toml|eslint\.config\.[^/]+|"
-    r"\.eslintrc[^/]*|tsconfig[^/]*\.json|Cargo\.toml|go\.mod|CMakeLists\.txt|package\.json)$"
+    r"(?:^|/)(?:\.gitignore|pyproject\.toml|setup\.cfg|tox\.ini|noxfile\.py|conftest\.py|"
+    r"pytest\.ini|\.?mypy\.ini|\.?ruff\.toml|eslint\.config\.[^/]+|\.eslintrc[^/]*|"
+    r"(?:jest|vitest)\.config\.[^/]+|tsconfig[^/]*\.json|Cargo\.toml|\.cargo/config(?:\.toml)?|"
+    r"\.?clippy\.toml|go\.mod|\.golangci\.(?:ya?ml|toml|json)|CMakeLists\.txt|package\.json)$"
+    # `python -m pytest` imports from the worktree root first, so these would replace pytest.
+    r"|^(?:_?pytest|pluggy)(?:\.py$|/)"
 )
 
 

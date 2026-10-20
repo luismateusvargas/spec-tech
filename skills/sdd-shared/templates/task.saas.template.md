@@ -4,6 +4,7 @@ Status: draft | ready | blocked
 Project: <relative path to project YAML>
 Constitution: <relative path>
 Related domains: <relative paths to domain YAML>
+Target files: <comma-separated relative paths>
 
 ## Outcome and non-goals
 

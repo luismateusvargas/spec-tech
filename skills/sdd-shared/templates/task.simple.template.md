@@ -2,6 +2,7 @@
 
 Status: draft | ready | blocked
 Project rules: <relative path or section>
+Target files: <comma-separated relative paths>
 
 ## Outcome and boundary
 

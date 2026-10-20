@@ -7,34 +7,8 @@ from pathlib import Path
 
 from sdd_engine.artifacts import ArtifactError, ArtifactStore, WorkspaceRegistry
 from sdd_engine.limits import MAX_CONTEXT_BYTES, MAX_FILE_CHARS
-from sdd_engine.models import (
-    ArtifactRef,
-    GenerationPrompt,
-    GraphState,
-    Target,
-    WorkspaceFile,
-)
-
-TARGET_SKILLS: dict[Target, tuple[str, ...]] = {
-    Target.JAVASCRIPT: ("javascript-dev",),
-    Target.TYPESCRIPT: ("typescript-dev",),
-    Target.PYTHON: ("python-dev",),
-    Target.RUST: ("rust-dev",),
-    Target.GO: ("go-dev",),
-    Target.CPP: ("cpp-dev",),
-    Target.CPP_CV: ("cpp-dev", "cpp-cv-dev"),
-    Target.CPP_AAA: ("cpp-dev", "cpp-aaa-dev"),
-    Target.MYSQL: ("database-dev",),
-    Target.POSTGRESQL: ("database-dev",),
-    Target.PRISMA_JAVASCRIPT: ("database-dev", "javascript-dev"),
-    Target.PRISMA_TYPESCRIPT: ("database-dev", "typescript-dev"),
-    Target.SQLALCHEMY_ALEMBIC: ("database-dev", "python-dev"),
-    Target.DIESEL: ("database-dev", "rust-dev"),
-    Target.REACT_JAVASCRIPT: ("javascript-dev", "react-dev"),
-    Target.REACT_TYPESCRIPT: ("typescript-dev", "react-dev"),
-    Target.VUE_JAVASCRIPT: ("javascript-dev", "vue-dev"),
-    Target.VUE_TYPESCRIPT: ("typescript-dev", "vue-dev"),
-}
+from sdd_engine.models import ArtifactRef, GenerationPrompt, GraphState, WorkspaceFile
+from sdd_engine.targets import TARGETS
 
 
 class PromptHydrator:
@@ -72,8 +46,7 @@ class PromptHydrator:
 
         specification = load_text(state.specification)
         references = tuple(load_text(reference) for reference in state.context)
-        skills = TARGET_SKILLS[state.target]
-        guidance = tuple(self._load_skill(name) for name in skills)
+        guidance = tuple(self._load_skill(name) for name in TARGETS[state.target].skills)
         byte_count += sum(len(item.encode("utf-8")) for item in guidance)
         if byte_count > self._max_context_bytes:
             raise ArtifactError(

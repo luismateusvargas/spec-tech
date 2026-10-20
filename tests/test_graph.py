@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -45,6 +46,7 @@ from sdd_engine.models import (
     Tier,
     ValidationReport,
 )
+from sdd_engine.scope import scope_report, worktree_tree
 from sdd_engine.service import (
     begin_task,
     cancel_task,
@@ -54,13 +56,13 @@ from sdd_engine.service import (
     submit,
 )
 from sdd_engine.store import ProjectStore, project_database
+from sdd_engine.targets import standard_commands
 from sdd_engine.validation import (
     CommandSpec,
     DockerCommandRunner,
     NativeValidator,
     ValidationInfrastructureError,
     ValidationProfile,
-    standard_commands,
 )
 
 SPEC = "# Task\n\nStatus: ready\n\n## Outcome\n\nExpose VALUE = 1.\n"
@@ -928,6 +930,103 @@ def test_scope_flags_go_rust_cpp_and_spec_files(project: Path) -> None:
     assert findings["ui.spec.ts"] == ["test_changed_outside_plan", "skip_added"]
     assert findings["lib.rs"] == ["suppression_added", "skip_added"]
     assert findings["engine.cpp"] == ["suppression_added", "skip_added"]
+
+
+@pytest.fixture
+def repository(tmp_path: Path) -> Path:
+    """Create an empty committed Git worktree for scope-report checks."""
+    root = tmp_path / "repository"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _commit(root, "--allow-empty", "-qm", "initial")
+    return root
+
+
+def _scope_flags(root: Path, path: str, content: str) -> list[str]:
+    before = worktree_tree(root)
+    destination = root / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+    report = scope_report(root, before, worktree_tree(root), set(), set())
+    [finding] = cast(list[dict[str, Any]], report["changes"])
+    return cast(list[str], finding["flags"])
+
+
+@pytest.mark.parametrize(
+    ("path", "flags"),
+    [
+        ("conftest.py", ["test_changed_outside_plan", "check_config_changed"]),
+        ("pkg/conftest.py", ["test_changed_outside_plan", "check_config_changed"]),
+        (".cargo/config.toml", ["check_config_changed"]),
+        ("jest.config.js", ["check_config_changed"]),
+        ("web/vitest.config.ts", ["check_config_changed"]),
+        ("setup.cfg", ["check_config_changed"]),
+        ("tox.ini", ["check_config_changed"]),
+        ("noxfile.py", ["check_config_changed"]),
+        (".golangci.yml", ["check_config_changed"]),
+        (".golangci.yaml", ["check_config_changed"]),
+        ("clippy.toml", ["check_config_changed"]),
+        (".clippy.toml", ["check_config_changed"]),
+        (".mypy.ini", ["check_config_changed"]),
+        ("pytest.py", ["check_config_changed"]),
+        ("_pytest/__init__.py", ["check_config_changed"]),
+        ("pkg/pytest.py", []),
+        ("docs/setup.md", []),
+    ],
+)
+def test_scope_flags_test_and_check_configuration_paths(
+    repository: Path, path: str, flags: list[str]
+) -> None:
+    assert _scope_flags(repository, path, "value = 1\n") == flags
+
+
+@pytest.mark.parametrize(
+    ("line", "flag"),
+    [
+        ("// @ts-expect-error", "suppression_added"),
+        ("// @ts-nocheck", "suppression_added"),
+        ("_ = f() //nolint:errcheck", "suppression_added"),
+        ("_ = f() // nolint", "suppression_added"),
+        ("// NOLINTNEXTLINE(bugprone-branch-clone)", "suppression_added"),
+        ("#![allow(dead_code)]", "suppression_added"),
+        ("#[expect(unused_variables)]", "suppression_added"),
+        ("value = f()  # pyright: ignore", "suppression_added"),
+        ("# pylint: disable=all", "suppression_added"),
+        ("@pytest.mark.xfail", "skip_added"),
+        ("@pytest.mark.skipif(True, reason='later')", "skip_added"),
+        ("@unittest.skipIf(True, 'later')", "skip_added"),
+        ("xit('x', () => {})", "skip_added"),
+        ("xdescribe('suite', () => {})", "skip_added"),
+        ("test.todo('later')", "skip_added"),
+        ("TEST(Suite, DISABLED_case) {}", "skip_added"),
+        ("DISABLED_FEATURES = ()", None),
+    ],
+)
+def test_scope_flags_suppression_and_skip_markers(
+    repository: Path, line: str, flag: str | None
+) -> None:
+    flags = _scope_flags(repository, "src/sample.txt", f"{line}\n")
+
+    assert flags == ([] if flag is None else [flag])
+
+
+def test_node_events_log_outcomes_without_file_content(
+    project: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="sdd_engine")
+    run_id = str(_begin(project)["run_id"])
+    submit(str(project), run_id, generation_args(error_handling_mapping=[]))
+    submit(str(project), run_id, generation_args())
+
+    events = [vars(record) for record in caplog.records if "node" in vars(record)]
+    finished = [event for event in events if "status" in event]
+    outcomes = [(event["node"], event["status"], event["failure_category"]) for event in finished]
+    assert {event["run_id"] for event in events} == {run_id}
+    assert ("await_submission", "refinement_required", "generation_contract") in outcomes
+    assert outcomes[-1] == ("validate", "validated", None)
+    assert all(isinstance(event["duration_ms"], int) for event in finished)
+    # The spec and the submitted file both contain this text; no log record may carry it.
+    assert all("VALUE = 1" not in str(vars(record)) for record in caplog.records)
 
 
 def test_failed_run_prunes_empty_untracked_directories(

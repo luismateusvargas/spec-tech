@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from typing import Any, Literal, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, interrupt
@@ -24,6 +27,7 @@ from sdd_engine.artifacts import (
 from sdd_engine.guidance import PromptHydrator
 from sdd_engine.limits import (
     MAX_DIAGNOSTIC_CHARS,
+    MAX_FAILURE_REPORT_BYTES,
     MAX_GENERATED_ARTIFACT_BYTES,
     MAX_ORIGINAL_FILE_BYTES,
     MAX_PROMPT_ARTIFACT_BYTES,
@@ -43,6 +47,9 @@ from sdd_engine.models import (
     ValidationReport,
 )
 from sdd_engine.validation import NativeValidator, ValidationInfrastructureError
+
+# Node events carry identifiers, counters, statuses, and timings; never artifact content.
+logger = logging.getLogger(__name__)
 
 # Engine types that graph state stores in checkpoints. LangGraph warns on, and in strict
 # msgpack mode blocks, deserializing any type outside its allowlist.
@@ -111,7 +118,9 @@ def build_graph(
         ("validate", validate_node),
         ("rollback", rollback_node),
     ):
-        _add_strict_node(graph, name, partial(node, dependencies=dependencies))
+        _add_strict_node(
+            graph, name, _observed(name, partial(node, dependencies=dependencies), dependencies)
+        )
     graph.add_edge(START, "hydrate")
     graph.add_conditional_edges("hydrate", _route_after_hydration)
     graph.add_conditional_edges("await_submission", _route_after_submission)
@@ -548,6 +557,61 @@ def _route_after_validation(
 def _validate_state(raw_state: GraphState | dict[str, object]) -> GraphState:
     """Apply the strict state contract even after LangGraph node updates."""
     return GraphState.model_validate(raw_state)
+
+
+def _observed(
+    name: str,
+    node: Callable[[GraphState], dict[str, object]],
+    dependencies: EngineDependencies,
+) -> Callable[[GraphState], dict[str, object]]:
+    """Log a node's entry and exit with its run, attempt, outcome, and duration."""
+
+    def run(raw_state: GraphState) -> dict[str, object]:
+        state = _validate_state(raw_state)
+        fields: dict[str, object] = {
+            "run_id": state.run_id,
+            "node": name,
+            "attempt": state.generation_attempts,
+        }
+        logger.debug("node %s started", name, extra=fields)
+        started = time.monotonic()
+        try:
+            update = node(state)
+        except GraphInterrupt:
+            logger.info("node %s is awaiting a submission", name, extra=fields)
+            raise
+        except Exception as error:
+            fields.update(
+                error_type=type(error).__name__,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            logger.error("node %s raised %s", name, type(error).__name__, extra=fields)
+            raise
+        after = _validate_state(state.model_dump() | update)
+        failure_category = None
+        if "failure_report" in update and after.failure_report is not None:
+            failure_category = _failure_category(dependencies, after.failure_report)
+        fields.update(
+            attempt=after.generation_attempts,
+            status=after.status.value,
+            failure_category=failure_category,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        logger.info("node %s finished with status %s", name, after.status.value, extra=fields)
+        return update
+
+    return run
+
+
+def _failure_category(dependencies: EngineDependencies, reference: ArtifactRef) -> str | None:
+    """Read the category of a failure a node just recorded; logging never fails a node."""
+    try:
+        report = dependencies.artifacts.get_model(
+            reference, FailureReport, MAX_FAILURE_REPORT_BYTES
+        )
+    except ArtifactError:
+        return None
+    return report.category
 
 
 def _add_strict_node(

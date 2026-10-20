@@ -10,13 +10,13 @@ from typing import Any
 import pytest
 
 from sdd_engine.models import Target
+from sdd_engine.targets import standard_commands
 from sdd_engine.validation import (
     CommandSpec,
     DockerCommandRunner,
     NativeValidator,
     ValidationInfrastructureError,
     ValidationProfile,
-    standard_commands,
 )
 
 pytestmark = pytest.mark.docker

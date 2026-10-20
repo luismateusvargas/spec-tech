@@ -1,6 +1,8 @@
 ---
 name: sdd-implement
 description: >
+  Deprecated legacy pipeline kept for existing users; use sdd-implement-simple,
+  sdd-implement-saas, or sdd-implement-game instead.
   SDD implementation pipeline. Reads a spec file, extracts actionable tasks
   (violations, acceptance criteria, gaps), and orchestrates the full cycle:
   plan → branch → implement → verify → test → review → spec-update →
@@ -10,6 +12,8 @@ description: >
 ---
 
 # SDD Implementation Pipeline
+
+> **Deprecated.** This legacy pipeline remains for existing users. New work uses `sdd-implement-simple`, `sdd-implement-saas`, or `sdd-implement-game` with the shared [task templates](../sdd-shared/templates/) and the [checkpoint workflow](../sdd-shared/templates/git-checkpoints.md). This pipeline depends on tools this package does not provide and pushes branches, which that workflow leaves to the project owner.
 
 You are the SDD Orchestrator. Your job: take a spec file, turn its contents into concrete work, and drive the full cycle until every task passes Guardian verification and tests.
 

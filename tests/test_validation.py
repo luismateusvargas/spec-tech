@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from conftest import ScriptedRunner
 from pydantic import ValidationError
 
 from sdd_engine.models import CommandResult, Target
+from sdd_engine.targets import TARGETS, standard_commands
 from sdd_engine.validation import (
     CommandSpec,
     DockerCommandRunner,
@@ -19,9 +22,9 @@ from sdd_engine.validation import (
     ValidationInfrastructureError,
     ValidationProfile,
     stage_worktree,
-    standard_commands,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
 REAL_RUN = subprocess.run
 ROOTLESS_INFO = b'["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]\n'
 ROOTFUL_INFO = b'["name=seccomp,profile=builtin","name=cgroupns"]\n'
@@ -58,6 +61,38 @@ def test_validator_passes_when_all_commands_pass(tmp_path: Path) -> None:
 def test_validator_without_profile_is_an_infrastructure_error(tmp_path: Path) -> None:
     with pytest.raises(ValidationInfrastructureError, match="no native validation profile"):
         NativeValidator({}, ScriptedRunner()).validate(Target.GO, tmp_path)
+
+
+def test_validator_logs_each_command_without_its_output(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = ScriptedRunner(
+        [CommandResult(command_name="first", exit_code=2, stdout="command-output-marker")]
+    )
+    caplog.set_level(logging.INFO, logger="sdd_engine")
+
+    NativeValidator({Target.GO: PROFILE}, runner).validate(Target.GO, tmp_path)
+
+    [record] = caplog.records
+    fields = vars(record)
+    assert (fields["command_name"], fields["exit_code"], fields["timed_out"]) == ("first", 2, False)
+    assert fields["target"] == "go"
+    assert isinstance(fields["duration_ms"], int)
+    assert "command-output-marker" not in str(fields)
+
+
+def test_validator_logs_a_command_that_cannot_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = ScriptedRunner([ValidationInfrastructureError("daemon unavailable")])
+    caplog.set_level(logging.INFO, logger="sdd_engine")
+
+    with pytest.raises(ValidationInfrastructureError):
+        NativeValidator({Target.GO: PROFILE}, runner).validate(Target.GO, tmp_path)
+
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert vars(record)["command_name"] == "first"
 
 
 def test_profile_output_limit_cannot_exceed_command_result_cap() -> None:
@@ -479,3 +514,22 @@ def test_standard_profiles_end_with_the_test_suite(
 def test_database_targets_require_explicit_profiles(target: Target, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="disposable-database"):
         standard_commands(target, tmp_path)
+
+
+def test_target_registry_covers_every_target_with_packaged_skills() -> None:
+    skills = {skill for spec in TARGETS.values() for skill in spec.skills}
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    packaged = {Path(entry).name for entry in pyproject["tool"]["setuptools"]["data-files"]}
+
+    assert set(TARGETS) == set(Target)
+    assert [
+        skill for skill in sorted(skills) if not (ROOT / "skills" / skill / "SKILL.md").is_file()
+    ] == []
+    assert packaged == skills
+
+
+def test_engine_protocol_names_every_target() -> None:
+    protocol = ROOT / "skills" / "sdd-shared" / "templates" / "engine-protocol.md"
+    text = protocol.read_text(encoding="utf-8")
+
+    assert [target.value for target in Target if f"`{target.value}`" not in text] == []

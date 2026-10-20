@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import uuid
@@ -42,12 +43,11 @@ from sdd_engine.scope import (
     worktree_tree,
 )
 from sdd_engine.store import ProjectStore, RunRecord, StoredProfile, project_database
-from sdd_engine.validation import (
-    DockerCommandRunner,
-    NativeValidator,
-    ValidationProfile,
-    standard_commands,
-)
+from sdd_engine.targets import standard_commands
+from sdd_engine.validation import DockerCommandRunner, NativeValidator, ValidationProfile
+
+# Run events carry identifiers, statuses, counts, and timings; never spec or file content.
+logger = logging.getLogger(__name__)
 
 # The header block runs from the top of the spec to its first level-two heading.
 _SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
@@ -247,6 +247,16 @@ def begin_task(
         store.update_run(run_id, phase=RunPhase.FINISHED.value, outcome=RunStatus.FAILED.value)
         raise
     _persist_step(store, run_id, result)
+    logger.info(
+        "run %s started",
+        run_id,
+        extra={
+            "run_id": run_id,
+            "target": parsed_target.value,
+            "tier": request.tier.value,
+            "profile_revision": stored_profile.revision,
+        },
+    )
     return {"run_id": run_id, "model": model, **result}
 
 
@@ -273,7 +283,13 @@ def submit(workspace: str, run_id: str, files: dict[str, object]) -> dict[str, o
                     run_id, run_id, files, workspace_locked=True
                 )
             _persist_step(store, run_id, result)
-        except Exception:
+        except Exception as error:
+            logger.error(
+                "run %s submission raised %s",
+                run_id,
+                type(error).__name__,
+                extra={"run_id": run_id, "error_type": type(error).__name__},
+            )
             _finalize_run(root, store, store.run(run_id), failed=True)
             raise
     return {"run_id": run_id, **result}
@@ -316,6 +332,11 @@ def cancel_task(workspace: str, run_id: str) -> dict[str, object]:
     with WorkspaceRegistry({run_id: root}).lock(run_id):
         record = store.run(run_id)
         if record.phase is not RunPhase.FINISHED:
+            logger.info(
+                "run %s cancelled",
+                run_id,
+                extra={"run_id": run_id, "phase": record.phase.value},
+            )
             _finalize_run(root, store, record, failed=True)
     return get_run_report(workspace, run_id)
 
@@ -384,6 +405,20 @@ def _finalize_run(root: Path, store: ProjectStore, record: RunRecord, *, failed:
             report["rollback_error"] = "; ".join(errors)
     elif errors:
         report["scope_error"] = "; ".join(errors)
+    findings = report.get("changes")
+    changes = findings if isinstance(findings, list) else []
+    fields: dict[str, object] = {
+        "run_id": record.run_id,
+        "failed": failed,
+        "restored": report.get("restored"),
+        "head_changed": head_changed,
+        "changed_paths": len(changes),
+        "flagged_paths": sum(1 for item in changes if isinstance(item, dict) and item["flags"]),
+    }
+    if errors:
+        logger.warning("run %s finished with errors", record.run_id, extra=fields)
+    else:
+        logger.info("run %s finished", record.run_id, extra=fields)
     final_state = record.state
     if failed and final_state is not None:
         final_state = final_state.model_copy(update={"status": RunStatus.FAILED})

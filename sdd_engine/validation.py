@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -24,6 +26,9 @@ from sdd_engine.models import (
     Target,
     ValidationReport,
 )
+
+# Command events carry names, exit codes, and timings; never command output.
+logger = logging.getLogger(__name__)
 
 # Exit codes that `docker run` reserves for its own failures: daemon or option errors, a
 # command that cannot be invoked, and a command missing from the image.
@@ -346,7 +351,22 @@ class NativeValidator:
         results: list[CommandResult] = []
         with self._runner.staged(workspace):
             for command in profile.commands:
-                result = self._runner.run(command, workspace, profile)
+                fields: dict[str, object] = {"target": target.value, "command_name": command.name}
+                started = time.monotonic()
+                try:
+                    result = self._runner.run(command, workspace, profile)
+                except ValidationInfrastructureError:
+                    fields["duration_ms"] = round((time.monotonic() - started) * 1000)
+                    logger.warning("command %s could not run", command.name, extra=fields)
+                    raise
+                fields.update(
+                    exit_code=result.exit_code,
+                    timed_out=result.timed_out,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+                logger.info(
+                    "command %s exited with %d", command.name, result.exit_code, extra=fields
+                )
                 results.append(result)
                 if result.exit_code != 0 or result.timed_out:
                     break
@@ -365,84 +385,6 @@ class NativeValidator:
             profile_revision=None if version is None else version[0],
             profile_digest=None if version is None else version[1],
         )
-
-
-def standard_commands(target: Target, workspace: Path) -> tuple[CommandSpec, ...]:
-    """Return common project-native checks; database-specific commands remain configured.
-
-    Every profile ends with the project's tests, so a run validates only when its tests pass.
-    pytest (exit 5), npm (no `test` script), and ctest (`--no-tests=error`) also fail when
-    there are no tests; `cargo test` and `go test` pass an empty suite. Ruff and mypy run
-    with `python -P`, so modules in the workspace cannot shadow the tools themselves.
-    """
-    if target in {Target.RUST, Target.DIESEL}:
-        return (
-            CommandSpec(name="cargo-check", argv=("cargo", "check")),
-            CommandSpec(name="cargo-clippy", argv=("cargo", "clippy", "--", "-D", "warnings")),
-            CommandSpec(name="cargo-test", argv=("cargo", "test")),
-        )
-    if target in {
-        Target.PYTHON,
-        Target.SQLALCHEMY_ALEMBIC,
-    }:
-        return (
-            CommandSpec(name="ruff-check", argv=("python", "-P", "-m", "ruff", "check", ".")),
-            CommandSpec(name="mypy-strict", argv=("python", "-P", "-m", "mypy", "--strict", ".")),
-            CommandSpec(name="pytest", argv=("python", "-m", "pytest", "-q")),
-        )
-    if target in {
-        Target.TYPESCRIPT,
-        Target.REACT_TYPESCRIPT,
-        Target.VUE_TYPESCRIPT,
-        Target.PRISMA_TYPESCRIPT,
-    }:
-        commands = [CommandSpec(name="tsc-no-emit", argv=("node_modules/.bin/tsc", "--noEmit"))]
-        prisma_schema = _find_prisma_schema(workspace)
-        if prisma_schema is not None:
-            commands.append(
-                CommandSpec(
-                    name="prisma-validate",
-                    argv=("node_modules/.bin/prisma", "validate", "--schema", prisma_schema),
-                )
-            )
-        commands.append(NPM_TEST)
-        return tuple(commands)
-    if target in {Target.JAVASCRIPT, Target.REACT_JAVASCRIPT, Target.VUE_JAVASCRIPT}:
-        return (
-            CommandSpec(name="eslint", argv=("node_modules/.bin/eslint", ".", "--max-warnings=0")),
-            NPM_TEST,
-        )
-    if target is Target.GO:
-        return (
-            CommandSpec(name="go-vet", argv=("go", "vet", "./...")),
-            CommandSpec(name="go-test", argv=("go", "test", "./...")),
-        )
-    if target in {Target.CPP, Target.CPP_CV, Target.CPP_AAA}:
-        return (
-            CommandSpec(name="cmake-build", argv=("cmake", "--build", "build", "--parallel")),
-            CommandSpec(
-                name="ctest",
-                argv=("ctest", "--test-dir", "build", "--output-on-failure", "--no-tests=error"),
-            ),
-        )
-    if target is Target.PRISMA_JAVASCRIPT:
-        return (
-            CommandSpec(
-                name="prisma-validate",
-                argv=(
-                    "node_modules/.bin/prisma",
-                    "validate",
-                    "--schema",
-                    _find_prisma_schema(workspace) or "prisma/schema.prisma",
-                ),
-            ),
-            NPM_TEST,
-        )
-    if target in {Target.MYSQL, Target.POSTGRESQL}:
-        raise ValueError(
-            f"{target.value} requires an explicit disposable-database validation profile"
-        )
-    raise ValueError(f"no standard native commands are defined for {target.value}")
 
 
 def stage_worktree(workspace_root: Path, staging_root: Path) -> None:
@@ -489,15 +431,6 @@ def stage_worktree(workspace_root: Path, staging_root: Path) -> None:
                 shutil.copy2(source, destination, follow_symlinks=False)
     except OSError as error:
         raise ValidationInfrastructureError(f"could not stage the worktree: {error}") from error
-
-
-def _find_prisma_schema(workspace: Path) -> str | None:
-    """Find a conventional Prisma schema path without accepting user input."""
-    candidates = (workspace / "prisma" / "schema.prisma", workspace / "schema.prisma")
-    for candidate in candidates:
-        if candidate.is_file() and candidate.resolve().is_relative_to(workspace.resolve()):
-            return candidate.relative_to(workspace).as_posix()
-    return None
 
 
 def _docker_client_environment() -> dict[str, str]:
