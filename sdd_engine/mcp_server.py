@@ -3,33 +3,83 @@
 from __future__ import annotations
 
 import argparse
+from typing import NotRequired
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import ConfigDict, with_config
+
+# Pydantic requires this TypedDict before Python 3.12.
+from typing_extensions import TypedDict
 
 from sdd_engine import service
+from sdd_engine.models import Target, Tier
 
 implementer = FastMCP("spec-tech-engine")
 administrator = FastMCP("spec-tech-engine-config")
 
 
+# These shapes publish the `GenerationOutput` JSON Schema to MCP clients but check only
+# structure. Content rules stay in the graph, which counts violations as repair attempts.
+@with_config(ConfigDict(extra="forbid"))
+class WorkspaceFileInput(TypedDict):
+    """One whole file to write at an approved target path."""
+
+    path: str
+    content: str
+
+
+@with_config(ConfigDict(extra="forbid"))
+class ErrorHandlingMappingInput(TypedDict):
+    """How one infrastructure failure becomes a domain error."""
+
+    failure: str
+    domain_exception: str
+    treatment: str
+
+
+@with_config(ConfigDict(extra="forbid"))
+class SubmissionPayload(TypedDict):
+    """Whole files plus the documentation and error-handling account for one round."""
+
+    files: list[WorkspaceFileInput]
+    documentation_metadata: str
+    error_handling_mapping: list[ErrorHandlingMappingInput]
+    no_failure_paths: NotRequired[bool]
+
+
 @implementer.tool()
 def begin_task(
     workspace: str,
-    spec: str,
-    tier: str,
-    target: str,
-    target_files: list[str],
+    tier: Tier,
+    target: Target,
     model: str,
+    spec: str | None = None,
+    spec_path: str | None = None,
+    target_files: list[str] | None = None,
     context: list[str] | None = None,
 ) -> dict[str, object]:
-    """Start an implementation run and return its hydrated agent prompt."""
-    return service.begin_task(workspace, spec, tier, target, target_files, model, context)
+    """Start an implementation run and return its hydrated agent prompt.
+
+    Pass `spec_path` to bind the run to a spec committed at HEAD, or `spec` as inline text.
+    The spec header must say `Status: ready`; its `Target files:` line, when present, may
+    stand in for `target_files`.
+    """
+    return service.begin_task(
+        workspace,
+        tier=tier,
+        target=target,
+        model=model,
+        spec=spec,
+        spec_path=spec_path,
+        target_files=target_files,
+        context=context,
+    )
 
 
 @implementer.tool()
-def submit(workspace: str, run_id: str, files: dict[str, object]) -> dict[str, object]:
+def submit(workspace: str, run_id: str, files: SubmissionPayload) -> dict[str, object]:
     """Submit whole files and required metadata for a paused run."""
-    return service.submit(workspace, run_id, files)
+    return service.submit(workspace, run_id, dict(files))
 
 
 @implementer.tool()

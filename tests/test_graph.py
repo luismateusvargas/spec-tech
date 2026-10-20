@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -9,10 +10,18 @@ from typing import Any, cast
 
 import pytest
 from conftest import TARGET_FILE, generation_args
+from mcp.server.fastmcp.exceptions import ToolError
 
+from sdd_engine import mcp_server
 from sdd_engine.artifacts import ArtifactError
-from sdd_engine.errors import ProfileError, RunNotFoundError, WorkspaceMismatchError
-from sdd_engine.models import CommandResult, GraphInput, RunPhase, RunStatus, Target
+from sdd_engine.errors import (
+    ProfileError,
+    RunNotFoundError,
+    SpecContractError,
+    WorkspaceMismatchError,
+)
+from sdd_engine.limits import MAX_FILE_CHARS
+from sdd_engine.models import CommandResult, GraphInput, RunPhase, RunStatus, Target, Tier
 from sdd_engine.service import (
     begin_task,
     configure_profile,
@@ -23,9 +32,19 @@ from sdd_engine.service import (
 from sdd_engine.store import ProjectStore, project_database
 from sdd_engine.validation import CommandSpec, ValidationProfile, standard_commands
 
+SPEC = "# Task\n\nStatus: ready\n\n## Outcome\n\nExpose VALUE = 1.\n"
+SPEC_PATH = "specs/task.md"
 
-def _git(root: Path, *args: str) -> None:
-    subprocess.run(("git", "-C", str(root), *args), check=True, capture_output=True)
+
+def _git(root: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(root), *args), check=True, capture_output=True, text=True
+    )
+    return completed.stdout
+
+
+def _commit(root: Path, *args: str) -> None:
+    _git(root, "-c", "user.email=test@example.test", "-c", "user.name=Test", "commit", *args)
 
 
 @pytest.fixture
@@ -34,17 +53,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     _git(root, "init", "-q")
-    _git(
-        root,
-        "-c",
-        "user.email=test@example.test",
-        "-c",
-        "user.name=Test",
-        "commit",
-        "--allow-empty",
-        "-qm",
-        "initial",
-    )
+    _commit(root, "--allow-empty", "-qm", "initial")
     profile = ValidationProfile(
         image="busybox:1.37", commands=(CommandSpec(name="check", argv=("true",)),)
     )
@@ -59,17 +68,23 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
-def _begin(root: Path) -> dict[str, object]:
-    return begin_task(
-        str(root), "Expose VALUE = 1.", "simple", "python", [TARGET_FILE], "planned-model"
-    )
+def _begin(root: Path, **overrides: Any) -> dict[str, object]:
+    arguments: dict[str, Any] = {
+        "tier": "simple",
+        "target": "python",
+        "model": "planned-model",
+        "spec": SPEC,
+        "target_files": [TARGET_FILE],
+    }
+    arguments.update(overrides)
+    return begin_task(str(root), **arguments)
 
 
 def test_begin_pauses_and_persists_prompt(project: Path) -> None:
     result = _begin(project)
     prompt = result["prompt"]
     assert isinstance(prompt, dict)
-    assert prompt["specification_text"] == "Expose VALUE = 1."
+    assert prompt["specification_text"] == SPEC
     assert prompt["allowed_target_files"] == [TARGET_FILE]
     report = cast(dict[str, Any], get_run_report(str(project), str(result["run_id"])))
     assert report["model"] == "planned-model"
@@ -148,17 +163,7 @@ def test_head_move_refuses_broader_rollback(project: Path, monkeypatch: pytest.M
     (project / "rogue.py").write_text("x\n", encoding="utf-8")
     for _ in range(3):
         submit(str(project), run_id, generation_args())
-    _git(
-        project,
-        "-c",
-        "user.email=test@example.test",
-        "-c",
-        "user.name=Test",
-        "commit",
-        "--allow-empty",
-        "-qm",
-        "moved",
-    )
+    _commit(project, "--allow-empty", "-qm", "moved")
     report = cast(dict[str, Any], finish_task(str(project), run_id))
     assert report["scope_report"]["head_changed"] is True
     assert report["scope_report"]["restored"] is False
@@ -354,10 +359,210 @@ def test_deleted_test_file_is_flagged_for_review(project: Path) -> None:
     }
 
 
-def test_begin_rejects_blocked_task_spec(project: Path) -> None:
-    blocked_spec = "# Task\n\nStatus: blocked\n\n## Outcome\nWait for decision.\n"
-    with pytest.raises(ValueError, match="Status: blocked"):
-        begin_task(str(project), blocked_spec, "simple", "python", [TARGET_FILE], "planned-model")
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ("# Task\n\nStatus: blocked\n\n## Outcome\nWait for decision.\n", "'blocked'"),
+        ("# Task\n\nStatus: draft\n", "'draft'"),
+        ("# Task\n\nStatus: draft | ready | blocked\n", "'draft | ready | blocked'"),
+        ("# Task\n\nExpose VALUE = 1.\n", r"found \[\]"),
+        ("# Task\n\nStatus: ready\nStatus: ready\n", "'ready', 'ready'"),
+        ("# Task\n\nStatus:\nready\n", r"found \[''\]"),
+        ("## Outcome\n\nStatus: ready\n", r"found \[\]"),
+    ],
+)
+def test_begin_requires_a_ready_spec_header(project: Path, spec: str, message: str) -> None:
+    with pytest.raises(SpecContractError, match=message):
+        _begin(project, spec=spec)
+
+    assert "prompt" in _begin(project)
+
+
+def test_begin_reads_status_only_from_the_spec_header(project: Path) -> None:
+    spec = "# Task\n\nstatus: Ready\n\n## Open decisions\n\n  status: blocked\nStatus: blocked\n"
+
+    with pytest.raises(SpecContractError, match="'Ready'"):
+        _begin(project, spec=spec)
+    result = _begin(project, spec=spec.replace("Ready", "ready", 1))
+
+    assert "prompt" in result
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"spec": None}, "requires spec or spec_path"),
+        ({"target_files": None}, "target_files is required"),
+        (
+            {"spec": SPEC.replace("\n\n## ", "\nTarget files: pkg/other.py\n\n## ")},
+            "must match the spec header",
+        ),
+        (
+            {"spec": SPEC.replace("\n\n## ", "\nTarget files: ../outside.py\n\n## ")},
+            "safe relative POSIX path",
+        ),
+        (
+            {"spec": SPEC.replace("\n\n## ", "\nTarget files: a.py, ./a.py\n\n## ")},
+            "repeats a path",
+        ),
+    ],
+)
+def test_begin_rejects_inconsistent_spec_arguments(
+    project: Path, overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(SpecContractError, match=message):
+        _begin(project, **overrides)
+
+
+@pytest.fixture
+def committed_spec(project: Path) -> str:
+    """Commit a ready spec that declares its target files."""
+    spec = (
+        "# Task\n\nStatus: ready\nTarget files: `pkg/module.py`, pkg/other.py\n\n"
+        "## Outcome\n\nExpose VALUE = 1.\n"
+    )
+    (project / "specs").mkdir()
+    (project / SPEC_PATH).write_text(spec, encoding="utf-8")
+    _git(project, "add", "--", SPEC_PATH)
+    _commit(project, "-qm", "spec")
+    return spec
+
+
+def test_begin_binds_a_committed_spec_and_its_target_files(
+    project: Path, committed_spec: str
+) -> None:
+    result = _begin(project, spec=None, spec_path=SPEC_PATH, target_files=None)
+
+    prompt = cast(dict[str, Any], result["prompt"])
+    assert prompt["specification_text"] == committed_spec
+    assert prompt["allowed_target_files"] == ["pkg/module.py", "pkg/other.py"]
+    record = ProjectStore(project_database(project)).run(str(result["run_id"]))
+    expected_blob = _git(project, "rev-parse", f"HEAD:{SPEC_PATH}").strip()
+    assert (record.spec_path, record.spec_blob) == (SPEC_PATH, expected_blob)
+
+
+def test_committed_spec_accepts_matching_text_and_target_files(
+    project: Path, committed_spec: str
+) -> None:
+    result = _begin(
+        project,
+        spec=committed_spec,
+        spec_path=f"./{SPEC_PATH}",
+        target_files=["pkg/other.py", "pkg/./module.py"],
+    )
+
+    record = ProjectStore(project_database(project)).run(str(result["run_id"]))
+    assert record.spec_path == SPEC_PATH
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"spec": SPEC}, "differs from 'specs/task.md' committed at HEAD"),
+        ({"target_files": [TARGET_FILE]}, "must match the spec header"),
+        ({"spec_path": "specs/missing.md"}, "not committed at HEAD"),
+        ({"spec_path": "specs"}, "not a regular file"),
+        ({"spec_path": "../task.md"}, "safe relative POSIX path"),
+    ],
+)
+def test_committed_spec_binding_rejects_mismatches(
+    project: Path, committed_spec: str, overrides: dict[str, object], message: str
+) -> None:
+    arguments: dict[str, object] = {"spec": None, "spec_path": SPEC_PATH, "target_files": None}
+    arguments.update(overrides)
+
+    with pytest.raises(SpecContractError, match=message):
+        _begin(project, **arguments)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_committed_spec_rejects_uncommitted_edits(
+    project: Path, committed_spec: str, staged: bool
+) -> None:
+    (project / SPEC_PATH).write_text(committed_spec + "Also expose OTHER.\n", encoding="utf-8")
+    if staged:
+        _git(project, "add", "--", SPEC_PATH)
+
+    with pytest.raises(SpecContractError, match="uncommitted changes"):
+        _begin(project, spec=None, spec_path=SPEC_PATH, target_files=None)
+
+
+def test_oversized_submission_is_a_retryable_contract_failure(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    oversized = generation_args(files=[{"path": TARGET_FILE, "content": "x" * 5_000_000}])
+
+    first = cast(dict[str, Any], submit(str(project), run_id, oversized))
+
+    assert "generation_contract" in first["prompt"]["generation_feedback"]
+    assert not (project / TARGET_FILE).exists()
+    second = cast(dict[str, Any], submit(str(project), run_id, generation_args()))
+    assert second["state"]["status"] == RunStatus.VALIDATED.value
+    assert second["state"]["generation_attempts"] == 2
+
+
+def test_target_file_too_large_to_resubmit_fails_hydration(project: Path) -> None:
+    (project / "pkg").mkdir()
+    (project / TARGET_FILE).write_text("x" * (MAX_FILE_CHARS + 1), encoding="utf-8")
+
+    result = cast(dict[str, Any], _begin(project))
+
+    assert result["state"]["status"] == RunStatus.FAILED.value
+    report = cast(dict[str, Any], get_run_report(str(project), str(result["run_id"])))
+    assert report["failure_report"]["category"] == "hydration"
+    assert "whole-file limit" in report["failure_report"]["diagnostics"]
+
+
+def _schema_definition(schema: dict[str, Any], name: str) -> dict[str, Any]:
+    reference = str(schema["properties"][name]["$ref"]).rsplit("/", 1)[-1]
+    return cast(dict[str, Any], schema["$defs"][reference])
+
+
+def test_mcp_tools_publish_typed_schemas() -> None:
+    tools = {tool.name: tool for tool in asyncio.run(mcp_server.implementer.list_tools())}
+    begin_schema = tools["begin_task"].inputSchema
+    submit_schema = tools["submit"].inputSchema
+
+    payload = _schema_definition(submit_schema, "files")
+    assert _schema_definition(begin_schema, "tier")["enum"] == [tier.value for tier in Tier]
+    assert _schema_definition(begin_schema, "target")["enum"] == [item.value for item in Target]
+    assert set(begin_schema["required"]) == {"workspace", "tier", "target", "model"}
+    assert set(payload["properties"]) == {
+        "files",
+        "documentation_metadata",
+        "error_handling_mapping",
+        "no_failure_paths",
+    }
+    assert payload["required"] == ["files", "documentation_metadata", "error_handling_mapping"]
+    assert payload["additionalProperties"] is False
+
+
+def test_mcp_submit_leaves_content_rules_to_the_graph(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    arguments = {
+        "workspace": str(project),
+        "run_id": run_id,
+        "files": generation_args(documentation_metadata="Args: Raises:"),
+    }
+
+    asyncio.run(mcp_server.implementer.call_tool("submit", arguments))
+
+    report = cast(dict[str, Any], get_run_report(str(project), run_id))
+    assert report["phase"] == RunPhase.PENDING.value
+    assert "each followed by text" in report["prompt"]["generation_feedback"]
+    assert not (project / TARGET_FILE).exists()
+
+
+def test_mcp_submit_rejects_malformed_payloads_before_the_graph(project: Path) -> None:
+    run_id = str(_begin(project)["run_id"])
+    malformed = generation_args()
+    del malformed["documentation_metadata"]
+    arguments = {"workspace": str(project), "run_id": run_id, "files": malformed}
+
+    with pytest.raises(ToolError, match="documentation_metadata"):
+        asyncio.run(mcp_server.implementer.call_tool("submit", arguments))
+
+    report = cast(dict[str, Any], get_run_report(str(project), run_id))
+    assert report["prompt"]["generation_feedback"] is None
 
 
 def test_scope_flags_go_rust_cpp_and_spec_files(project: Path) -> None:

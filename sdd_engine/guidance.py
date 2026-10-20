@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sdd_engine.artifacts import ArtifactError, ArtifactStore, WorkspaceRegistry
-from sdd_engine.limits import MAX_CONTEXT_BYTES
+from sdd_engine.limits import MAX_CONTEXT_BYTES, MAX_FILE_CHARS
 from sdd_engine.models import (
     ArtifactRef,
     GenerationPrompt,
@@ -86,6 +86,12 @@ class PromptHydrator:
             remaining = self._max_context_bytes - byte_count
             content = self._workspaces.read_text(state.workspace_id, path, max(remaining, 0))
             if content is not None:
+                # The implementer must be able to resubmit every target file whole.
+                if len(content) > MAX_FILE_CHARS:
+                    raise ArtifactError(
+                        f"target file {path!r} exceeds the {MAX_FILE_CHARS}-character "
+                        "whole-file limit"
+                    )
                 byte_count += len(content.encode("utf-8"))
                 existing_files.append(WorkspaceFile(path=path, content=content))
 

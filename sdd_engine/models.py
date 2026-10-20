@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Annotated, TypeVar
 
@@ -19,7 +20,10 @@ from sdd_engine.limits import (
     MAX_COMMAND_NAME_CHARS,
     MAX_CONTEXT_REFS,
     MAX_DIAGNOSTIC_CHARS,
+    MAX_FILE_CHARS,
+    MAX_GENERATED_ARTIFACT_BYTES,
     MAX_PATH_CHARS,
+    MAX_SUBMISSION_BYTES,
     MAX_SUMMARY_CHARS,
     MAX_TARGET_FILES,
 )
@@ -164,17 +168,9 @@ class GraphInput(StrictModel):
         return value
 
 
-class GraphState(StrictModel):
+class GraphState(GraphInput):
     """Minimal pointer-based state shared between LangGraph nodes."""
 
-    run_id: Annotated[str, Field(min_length=1, max_length=128)]
-    workspace_id: Annotated[str, Field(min_length=1, max_length=128)]
-    target: TargetValue
-    tier: TierValue
-    specification: ArtifactRef
-    target_files: TargetFiles
-    context: JsonTuple[ArtifactRef] = ()
-    target_entities: JsonTuple[Annotated[str, Field(min_length=1, max_length=256)]] = ()
     generated_artifact: ArtifactRef | None = None
     validation_report: ArtifactRef | None = None
     failure_report: ArtifactRef | None = None
@@ -194,7 +190,27 @@ class WorkspaceFile(StrictModel):
     """One whole workspace file: generated output, or existing content shown to the model."""
 
     path: SafeRelativePath
-    content: str
+    content: Annotated[str, Field(max_length=MAX_FILE_CHARS)]
+
+
+# Section markers in documentation_metadata. Each marker's section runs to the next marker.
+_DOC_SECTION = re.compile(
+    r"# Arguments|# Errors|# Returns|# Panics|# Safety|Args:|Raises:|Returns:|Yields:|"
+    r"@param\b|@throws\b|@returns?\b"
+)
+_ARGUMENT_MARKERS = frozenset({"# Arguments", "Args:", "@param"})
+_ERROR_MARKERS = frozenset({"# Errors", "Raises:", "@throws"})
+
+
+def _documented_markers(value: str) -> set[str]:
+    """Return the section markers followed by text before the next section begins."""
+    matches = list(_DOC_SECTION.finditer(value))
+    documented: set[str] = set()
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        if value[match.end() : end].strip():
+            documented.add(match.group())
+    return documented
 
 
 class GenerationOutput(StrictModel):
@@ -203,16 +219,31 @@ class GenerationOutput(StrictModel):
     files: JsonTuple[WorkspaceFile]
     documentation_metadata: Annotated[str, Field(min_length=1)]
     error_handling_mapping: JsonTuple[ErrorHandlingMapping]
+    # Declares that the change has no failure path to map, instead of an invented entry.
+    no_failure_paths: bool = False
 
-    @field_validator("error_handling_mapping")
-    @classmethod
-    def require_error_mapping(
-        cls, value: tuple[ErrorHandlingMapping, ...]
-    ) -> tuple[ErrorHandlingMapping, ...]:
-        """Require an explicit account of at least one failure treatment."""
-        if not value:
-            raise ValueError("error_handling_mapping must contain at least one entry")
-        return value
+    @model_validator(mode="after")
+    def require_error_account_and_bounded_size(self) -> GenerationOutput:
+        """Require mapped failures or an explicit claim of none, and bound the submission."""
+        if not self.error_handling_mapping and not self.no_failure_paths:
+            raise ValueError(
+                "error_handling_mapping must contain at least one entry "
+                "unless no_failure_paths is true"
+            )
+        if self.error_handling_mapping and self.no_failure_paths:
+            raise ValueError("error_handling_mapping must be empty when no_failure_paths is true")
+        content_bytes = sum(len(item.content.encode("utf-8")) for item in self.files)
+        if content_bytes > MAX_SUBMISSION_BYTES:
+            raise ValueError(
+                f"files contain {content_bytes} bytes; a submission may contain at most "
+                f"{MAX_SUBMISSION_BYTES}"
+            )
+        # JSON escapes can expand content; the stored artifact must load again for validation.
+        if len(self.model_dump_json().encode("utf-8")) > MAX_GENERATED_ARTIFACT_BYTES:
+            raise ValueError(
+                f"the submission exceeds {MAX_GENERATED_ARTIFACT_BYTES} bytes as stored JSON"
+            )
+        return self
 
     @field_validator("files")
     @classmethod
@@ -225,18 +256,25 @@ class GenerationOutput(StrictModel):
     @classmethod
     def require_documentation_sections(cls, value: str) -> str:
         """Require argument and error documentation without embedded examples."""
-        has_arguments = "# Arguments" in value or "Args:" in value or "@param" in value
-        has_errors = (
-            "# Errors" in value or "Raises:" in value or "@throws" in value or "@returns" in value
-        )
-        if not has_arguments or not has_errors:
+        documented = _documented_markers(value)
+        if not documented & _ARGUMENT_MARKERS or not documented & _ERROR_MARKERS:
             raise ValueError(
                 "documentation_metadata must contain # Arguments and # Errors "
-                "(or Args:/Raises: or @param/@throws)"
+                "(or Args:/Raises: or @param/@throws), each followed by text"
             )
         if "```" in value:
             raise ValueError("documentation_metadata must not contain inline code examples")
         return value
+
+
+SUBMISSION_SEMANTICS = (
+    "Submit whole-file contents for one or more paths in allowed_target_files; each "
+    "submitted file replaces that file entirely. Files written in earlier rounds remain on "
+    "disk. documentation_metadata documents arguments (# Arguments, Args:, or @param) and "
+    "errors (# Errors, Raises:, or @throws), each followed by text. error_handling_mapping "
+    "maps each failure to its domain exception and treatment; leave it empty only with "
+    "no_failure_paths set to true."
+)
 
 
 class GenerationPrompt(StrictModel):
@@ -254,6 +292,9 @@ class GenerationPrompt(StrictModel):
     existing_files: JsonTuple[WorkspaceFile] = ()
     validation_feedback: str | None = None
     generation_feedback: str | None = None
+    submission_semantics: str = SUBMISSION_SEMANTICS
+    # The JSON Schema of the `submit` payload, so any agent can build a valid submission.
+    submission_schema: dict[str, object] = Field(default_factory=GenerationOutput.model_json_schema)
 
 
 class FailureReport(StrictModel):

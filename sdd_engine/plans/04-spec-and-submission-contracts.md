@@ -1,6 +1,6 @@
 # Plan 04: Committed Spec Gate, Submission Contracts, and Typed MCP Schemas
 
-Status: ready
+Status: done
 Project rules: AGENTS.md, docs/coding/common.md, docs/coding/python.md, skills/python-dev/SKILL.md
 Target files: sdd_engine/models.py, sdd_engine/service.py, sdd_engine/mcp_server.py, sdd_engine/scope.py, tests/test_models.py, tests/test_graph.py
 Depends on: 01-limits-paths-and-errors.md, 03-store-and-worktree-isolation.md

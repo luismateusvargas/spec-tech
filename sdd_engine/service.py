@@ -11,7 +11,13 @@ from pathlib import Path
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from sdd_engine.artifacts import WorkspaceRegistry
-from sdd_engine.errors import ArtifactError, ProfileError, RunStateError, WorkspaceMismatchError
+from sdd_engine.errors import (
+    ArtifactError,
+    ProfileError,
+    RunStateError,
+    SpecContractError,
+    WorkspaceMismatchError,
+)
 from sdd_engine.graph import EngineDependencies, SddEngine, build_engine, checkpoint_serializer
 from sdd_engine.guidance import PromptHydrator
 from sdd_engine.limits import MAX_REPORT_BYTES
@@ -26,7 +32,15 @@ from sdd_engine.models import (
     Tier,
     ValidationReport,
 )
-from sdd_engine.scope import head, restore_tree, scope_report, tree_paths, worktree_tree
+from sdd_engine.paths import canonical_relative_path
+from sdd_engine.scope import (
+    committed_blob,
+    head,
+    restore_tree,
+    scope_report,
+    tree_paths,
+    worktree_tree,
+)
 from sdd_engine.store import ProjectStore, RunRecord, StoredProfile, project_database
 from sdd_engine.validation import (
     DockerCommandRunner,
@@ -35,7 +49,47 @@ from sdd_engine.validation import (
     standard_commands,
 )
 
-_BLOCKED_SPEC = re.compile(r"^\s*Status\s*:\s*blocked\b", re.IGNORECASE | re.MULTILINE)
+# The header block runs from the top of the spec to its first level-two heading.
+_SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
+# Horizontal whitespace only, so a key never takes its value from the following line.
+_STATUS_LINE = re.compile(r"^(?i:status):[ \t]*(?P<value>[^\r\n]*?)[ \t\r]*$", re.MULTILINE)
+_TARGET_FILES_LINE = re.compile(
+    r"^(?i:target files):[ \t]*(?P<value>[^\r\n]*?)[ \t\r]*$", re.MULTILINE
+)
+
+
+def parse_spec_header(spec_text: str) -> tuple[str, ...] | None:
+    """Require a ready spec and return the `Target files:` its header declares, if any.
+
+    Only the header block counts, so a `status:` line inside a later section is ignored.
+
+    # Errors
+
+    Raises `SpecContractError` unless the header has exactly one `Status: ready` line, or
+    when its `Target files:` line is repeated, empty, or names an unsafe or repeated path.
+    """
+    section = _SECTION_HEADING.search(spec_text)
+    header = spec_text if section is None else spec_text[: section.start()]
+    statuses = [match.group("value") for match in _STATUS_LINE.finditer(header)]
+    if statuses != ["ready"]:
+        raise SpecContractError(
+            f"task specification header must declare 'Status: ready', found {statuses}"
+        )
+    declared = [match.group("value") for match in _TARGET_FILES_LINE.finditer(header)]
+    if not declared:
+        return None
+    if len(declared) > 1:
+        raise SpecContractError("task specification header repeats 'Target files:'")
+    paths = [item.strip().strip("`").strip() for item in declared[0].split(",")]
+    if not any(paths):
+        raise SpecContractError("task specification header has an empty 'Target files:' line")
+    try:
+        files = tuple(canonical_relative_path(path) for path in paths)
+    except ValueError as error:
+        raise SpecContractError(f"task specification 'Target files:': {error}") from error
+    if len(set(files)) != len(files):
+        raise SpecContractError("task specification 'Target files:' repeats a path")
+    return files
 
 
 def _store_for(workspace: str) -> tuple[Path, ProjectStore]:
@@ -106,23 +160,62 @@ def get_profile(workspace: str, target: str) -> dict[str, object]:
 
 def begin_task(
     workspace: str,
-    spec: str,
+    *,
     tier: str,
     target: str,
-    target_files: list[str],
     model: str,
+    spec: str | None = None,
+    spec_path: str | None = None,
+    target_files: list[str] | None = None,
     context: list[str] | None = None,
 ) -> dict[str, object]:
-    """Record a planned model and pause the engine at its first implementer prompt."""
+    """Record a planned model and pause the engine at its first implementer prompt.
+
+    # Arguments
+
+    `spec_path` binds the run to a spec committed at `HEAD` and unchanged in the worktree;
+    `spec`, when also given, must equal that text. Without `spec_path`, `spec` is the spec
+    text. `target_files` may be omitted when the spec header declares `Target files:`, and
+    must name the same paths when both are given.
+
+    # Errors
+
+    Raises `SpecContractError` when the spec is not ready, cannot be bound to `HEAD`, or
+    disagrees with the given text or target files.
+    """
     if not model.strip():
         raise ValueError("the planned implementer model is required")
-    if _BLOCKED_SPEC.search(spec):
-        raise ValueError("cannot implement a task specification with Status: blocked")
     root, store = _store_for(workspace)
+    spec_blob: str | None = None
+    if spec_path is not None:
+        spec_blob, spec_text = committed_blob(root, spec_path)
+        spec_path = canonical_relative_path(spec_path)
+        if spec is not None and spec != spec_text:
+            raise SpecContractError(f"spec differs from {spec_path!r} committed at HEAD")
+    elif spec is not None:
+        spec_text = spec
+    else:
+        raise SpecContractError("begin_task requires spec or spec_path")
+    declared_files = parse_spec_header(spec_text)
+    if target_files is None:
+        if declared_files is None:
+            raise SpecContractError(
+                "target_files is required when the spec header declares no 'Target files:'"
+            )
+        target_files = list(declared_files)
+    elif declared_files is not None:
+        try:
+            requested = {canonical_relative_path(path) for path in target_files}
+        except ValueError as error:
+            raise SpecContractError(f"target_files: {error}") from error
+        if requested != set(declared_files):
+            raise SpecContractError(
+                f"target_files must match the spec header's 'Target files:' {list(declared_files)}"
+            )
     parsed_target = Target(target)
     stored_profile = store.get_profile_record(parsed_target)
     run_id = uuid.uuid4().hex
-    specification = store.put(spec.encode("utf-8"), "text/markdown")
+    specification = store.put(spec_text.encode("utf-8"), "text/markdown")
     references = tuple(store.put(item.encode("utf-8"), "text/plain") for item in (context or []))
     request = GraphInput(
         run_id=run_id,
@@ -142,6 +235,8 @@ def begin_task(
         worktree_tree(root),
         stored_profile.revision,
         stored_profile.digest,
+        spec_path,
+        spec_blob,
     )
     try:
         with store.connect() as connection:

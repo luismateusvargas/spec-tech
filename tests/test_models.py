@@ -6,9 +6,11 @@ import pytest
 from conftest import generation_args
 from pydantic import ValidationError
 
+from sdd_engine.limits import MAX_FILE_CHARS
 from sdd_engine.models import (
     CommandResult,
     GenerationOutput,
+    GenerationPrompt,
     GraphInput,
     GraphState,
     RunStatus,
@@ -62,7 +64,7 @@ def test_generation_output_accepts_parser_lists() -> None:
         "# Arguments\nNone.\n\n# Errors\nNone.",
         "Args:\n    x: int\n\nRaises:\n    ValueError: on bad input.",
         "@param x The value\n@throws Error on failure",
-        "@param x The value\n@returns The result",
+        "Args:\n    x: int\n\nReturns:\n    int\n\nRaises:\n    ValueError: on bad input.",
     ],
 )
 def test_generation_output_accepts_language_native_doc_sections(doc: str) -> None:
@@ -150,11 +152,36 @@ def test_models_reject_protected_or_control_character_paths(path: str) -> None:
     ("overrides", "message"),
     [
         ({"documentation_metadata": "# Arguments only"}, "# Arguments and # Errors"),
-        ({"documentation_metadata": "# Arguments\n# Errors\n```x```"}, "inline code"),
+        ({"documentation_metadata": "@param x The value\n@returns The result"}, "# Errors"),
+        ({"documentation_metadata": "Args: Raises:"}, "each followed by text"),
+        ({"documentation_metadata": "Args:\n    x: int\nRaises:\n"}, "each followed by text"),
+        (
+            {"documentation_metadata": "# Arguments\nx: value.\n# Errors\nNone.\n```x```"},
+            "inline code",
+        ),
         ({"files": [{"path": "../escape.py", "content": "x"}]}, "safe relative POSIX path"),
         ({"files": [{"path": ".", "content": "x"}]}, "identify a file"),
         ({"files": []}, "1 to 128 unique paths"),
-        ({"error_handling_mapping": []}, "at least one entry"),
+        ({"error_handling_mapping": []}, "at least one entry unless no_failure_paths"),
+        ({"no_failure_paths": True}, "must be empty when no_failure_paths"),
+        ({"files": [{"path": "big.py", "content": "x" * (MAX_FILE_CHARS + 1)}]}, "at most"),
+        (
+            {
+                "files": [
+                    {"path": f"part{index}.py", "content": "x" * MAX_FILE_CHARS}
+                    for index in range(4)
+                ]
+            },
+            "a submission may contain at most 3000000",
+        ),
+        (
+            {
+                "files": [
+                    {"path": f"part{index}.py", "content": "\x01" * 700_000} for index in range(2)
+                ]
+            },
+            "as stored JSON",
+        ),
         (
             {"files": [{"path": "a.py", "content": "1"}, {"path": "a.py", "content": "2"}]},
             "1 to 128 unique paths",
@@ -164,6 +191,39 @@ def test_models_reject_protected_or_control_character_paths(path: str) -> None:
 def test_generation_output_enforces_contract(overrides: dict[str, object], message: str) -> None:
     with pytest.raises(ValidationError, match=message):
         GenerationOutput.model_validate(generation_args(**overrides))
+
+
+def test_generation_output_accepts_an_explicit_absence_of_failure_paths() -> None:
+    output = GenerationOutput.model_validate(
+        generation_args(error_handling_mapping=[], no_failure_paths=True)
+    )
+
+    assert output.error_handling_mapping == ()
+    assert output.no_failure_paths is True
+
+
+def test_generation_prompt_describes_the_submission_contract() -> None:
+    prompt = GenerationPrompt(
+        run_id="run-1",
+        target=Target.PYTHON,
+        tier=Tier.SIMPLE,
+        allowed_target_files=("pkg/module.py",),
+        target_entities=(),
+        specification_text="Status: ready",
+        referenced_context=(),
+        engineering_guidance=(),
+    )
+
+    assert prompt.submission_schema == GenerationOutput.model_json_schema()
+    assert "allowed_target_files" in prompt.submission_semantics
+    assert "no_failure_paths" in prompt.submission_semantics
+
+
+def test_graph_state_extends_the_graph_input_fields() -> None:
+    assert issubclass(GraphState, GraphInput)
+    assert list(GraphState.model_fields)[: len(GraphInput.model_fields)] == list(
+        GraphInput.model_fields
+    )
 
 
 def test_validation_report_status_must_match_commands() -> None:

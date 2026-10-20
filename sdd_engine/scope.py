@@ -10,8 +10,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from sdd_engine.errors import GitOperationError, RollbackError
-from sdd_engine.paths import resolve_workspace_path
+from sdd_engine.errors import GitOperationError, RollbackError, SpecContractError
+from sdd_engine.limits import MAX_CONTEXT_BYTES
+from sdd_engine.paths import canonical_relative_path, resolve_workspace_path
 
 _SUPPRESSION = re.compile(
     r"(?:noqa\b|type:\s*ignore\b|eslint-disable\b|@ts-ignore\b|pragma:\s*no cover\b|"
@@ -75,6 +76,39 @@ def worktree_tree(workspace: Path, preserve: tuple[str, ...] = ()) -> str:
                 env=environment,
             )
         return _git(workspace, "write-tree", env=environment).decode().strip()
+
+
+def committed_blob(workspace: Path, relative_path: str) -> tuple[str, str]:
+    """Return the blob ID and UTF-8 text of a regular file committed at `HEAD`.
+
+    The worktree and index copies must match `HEAD`, so the run implements the reviewed text.
+
+    # Errors
+
+    Raises `SpecContractError` when the path is unsafe, absent from `HEAD`, not a regular
+    file, modified, too large, or not UTF-8, and `GitOperationError` when Git fails.
+    """
+    try:
+        path = canonical_relative_path(relative_path)
+    except ValueError as error:
+        raise SpecContractError(f"spec_path {relative_path!r}: {error}") from error
+    # `--literal-pathspecs` keeps a path such as `:(glob)*` from acting as pathspec magic.
+    entry = _git(workspace, "--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", path)
+    if not entry:
+        raise SpecContractError(f"spec_path {path!r} is not committed at HEAD")
+    mode, kind, blob = entry.split(b"\t", 1)[0].decode().split(" ")
+    if kind != "blob" or mode not in {"100644", "100755"}:
+        raise SpecContractError(f"spec_path {path!r} is not a regular file at HEAD")
+    if _git(workspace, "--literal-pathspecs", "status", "--porcelain", "-z", "--", path):
+        raise SpecContractError(f"spec_path {path!r} has uncommitted changes")
+    size = int(_git(workspace, "cat-file", "-s", blob).decode().strip())
+    if size > MAX_CONTEXT_BYTES:
+        raise SpecContractError(f"spec_path {path!r} exceeds {MAX_CONTEXT_BYTES} bytes")
+    try:
+        text = _git(workspace, "cat-file", "blob", blob).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SpecContractError(f"spec_path {path!r} is not UTF-8") from error
+    return blob, text
 
 
 def tree_paths(workspace: Path, tree: str) -> tuple[str, ...]:
