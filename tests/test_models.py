@@ -16,6 +16,7 @@ from sdd_engine.models import (
     Tier,
     ValidationReport,
 )
+from sdd_engine.paths import canonical_relative_path
 
 SPEC = {"digest": "a" * 64, "byte_length": 10, "media_type": "text/markdown"}
 
@@ -100,6 +101,49 @@ def test_graph_input_rejects_unsafe_target_paths(path: str) -> None:
 def test_graph_input_rejects_duplicate_target_paths() -> None:
     with pytest.raises(ValidationError, match="unique paths"):
         GraphInput.model_validate(api_payload(target_files=["a.rs", "a.rs"]))
+
+
+@pytest.mark.parametrize("alias", ["src/./x.py", "src//x.py"])
+def test_canonical_paths_reject_aliased_duplicates(alias: str) -> None:
+    request = GraphInput.model_validate(api_payload(target_files=[alias]))
+    output = GenerationOutput.model_validate(
+        generation_args(files=[{"path": alias, "content": "x"}])
+    )
+
+    assert canonical_relative_path(alias) == "src/x.py"
+    assert request.target_files == ("src/x.py",)
+    assert output.files[0].path == "src/x.py"
+    with pytest.raises(ValidationError, match="unique paths"):
+        GraphInput.model_validate(api_payload(target_files=["src/x.py", alias]))
+    with pytest.raises(ValidationError, match="unique paths"):
+        GenerationOutput.model_validate(
+            generation_args(
+                files=[
+                    {"path": "src/x.py", "content": "x"},
+                    {"path": alias, "content": "y"},
+                ]
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".GIT/hooks/pre-commit",
+        "src/x\x00.py",
+        "src/x\n.py",
+        "src/x\x7f.py",
+        "node_modules/.bin/tsc",
+        "src/node_modules/pkg/index.js",
+        "build/CTestTestfile.cmake",
+        "src/CMakeFiles/check.cmake",
+    ],
+)
+def test_models_reject_protected_or_control_character_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        GraphInput.model_validate(api_payload(target_files=[path]))
+    with pytest.raises(ValidationError):
+        GenerationOutput.model_validate(generation_args(files=[{"path": path, "content": "x"}]))
 
 
 @pytest.mark.parametrize(

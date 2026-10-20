@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sdd_engine.artifacts import ArtifactError, ArtifactStore, WorkspaceRegistry
+from sdd_engine.limits import MAX_CONTEXT_BYTES
 from sdd_engine.models import (
     ArtifactRef,
     GenerationPrompt,
@@ -43,7 +44,7 @@ class PromptHydrator:
         project_root: Path,
         artifacts: ArtifactStore,
         workspaces: WorkspaceRegistry,
-        max_context_bytes: int = 2_000_000,
+        max_context_bytes: int = MAX_CONTEXT_BYTES,
     ) -> None:
         """Configure runtime skill paths and bounded context hydration."""
         self._project_root = project_root.expanduser().resolve(strict=True)

@@ -69,14 +69,59 @@ def test_timeout_removes_the_container(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert _docker("container", "inspect", names[0]).returncode != 0
 
 
-def test_workspace_writes_are_owned_by_the_host_user(tmp_path: Path) -> None:
+def test_staged_writes_are_owned_by_the_host_user(tmp_path: Path) -> None:
     require_image(BUSYBOX_IMAGE)
     profile = busybox_profile("touch", "written")
+    runner = DockerCommandRunner()
+
+    with runner.staged(tmp_path) as staging:
+        result = runner.run(profile.commands[0], tmp_path, profile)
+        owner = (staging / "written").stat().st_uid
+
+    assert result.exit_code == 0, result.stderr
+    assert owner == os.getuid()
+    assert not (tmp_path / "written").exists()
+
+
+def test_container_cannot_see_or_write_the_git_directory(tmp_path: Path) -> None:
+    require_image(BUSYBOX_IMAGE)
+    subprocess.run(("git", "init", "-q", str(tmp_path)), check=True, capture_output=True)
+    database = tmp_path / ".git" / "spec-tech" / "engine.db"
+    database.parent.mkdir()
+    database.write_bytes(b"engine")
+    (tmp_path / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    profile = busybox_profile(
+        "sh",
+        "-c",
+        "test -f module.py && test ! -e .git && mkdir -p .git/hooks"
+        " && echo hook > .git/hooks/pre-commit && echo changed > module.py",
+    )
 
     result = DockerCommandRunner().run(profile.commands[0], tmp_path, profile)
 
     assert result.exit_code == 0, result.stderr
-    assert (tmp_path / "written").stat().st_uid == os.getuid()
+    assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()
+    assert database.read_bytes() == b"engine"
+    assert (tmp_path / "module.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_profile_commands_share_one_staged_workspace(tmp_path: Path) -> None:
+    require_image(BUSYBOX_IMAGE)
+    profile = ValidationProfile(
+        image=BUSYBOX_IMAGE,
+        commands=(
+            CommandSpec(name="build", argv=("sh", "-c", "mkdir build && touch build/output")),
+            CommandSpec(name="test", argv=("test", "-f", "build/output")),
+        ),
+        timeout_seconds=60,
+    )
+
+    report = NativeValidator({Target.GO: profile}, DockerCommandRunner()).validate(
+        Target.GO, tmp_path
+    )
+
+    assert report.passed, [(result.command_name, result.stderr) for result in report.commands]
+    assert not (tmp_path / "build").exists()
 
 
 def test_go_profile_passes_on_a_small_module(tmp_path: Path) -> None:

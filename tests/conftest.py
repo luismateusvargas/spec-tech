@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +36,11 @@ class ScriptedRunner:
 
     outcomes: list[CommandResult | Exception] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
+
+    @contextmanager
+    def staged(self, workspace: Path) -> Iterator[Path]:
+        """Run scripted commands against the workspace itself."""
+        yield workspace
 
     def run(
         self, command: CommandSpec, workspace: Path, profile: ValidationProfile

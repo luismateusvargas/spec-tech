@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
 import subprocess
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from sdd_engine.artifacts import ArtifactError
+from sdd_engine.errors import GitOperationError, RollbackError
+from sdd_engine.paths import resolve_workspace_path
 
 _SUPPRESSION = re.compile(
     r"(?:noqa\b|type:\s*ignore\b|eslint-disable\b|@ts-ignore\b|pragma:\s*no cover\b|"
@@ -29,11 +31,14 @@ _CHECK_CONFIG = re.compile(
 
 
 def _git(workspace: Path, *arguments: str, env: dict[str, str] | None = None) -> bytes:
-    result = subprocess.run(
-        ("git", *arguments), cwd=workspace, env=env, capture_output=True, check=False
-    )
+    try:
+        result = subprocess.run(
+            ("git", *arguments), cwd=workspace, env=env, capture_output=True, check=False
+        )
+    except OSError as error:
+        raise GitOperationError(f"could not run git {' '.join(arguments[:2])}") from error
     if result.returncode != 0:
-        raise ArtifactError(
+        raise GitOperationError(
             f"git {' '.join(arguments[:2])} failed: {result.stderr.decode(errors='replace')[:500]}"
         )
     return result.stdout
@@ -116,55 +121,56 @@ def scope_report(
 
 
 def _safe_path(workspace: Path, relative: str) -> Path:
-    path = PurePosixPath(relative)
-    if path.is_absolute() or ".." in path.parts or ".git" in path.parts or "\\" in relative:
-        raise ArtifactError("Git tree contains an unsafe path")
-    destination = workspace.joinpath(*path.parts)
-    if not destination.parent.resolve().is_relative_to(workspace.resolve()):
-        raise ArtifactError("a changed path traverses a symlink outside the workspace")
-    return destination
+    return resolve_workspace_path(workspace, relative, allow_tool_dirs=True)
 
 
 def restore_tree(workspace: Path, before: str, after: str, original_head: str) -> None:
     """Restore every changed worktree path, refusing a run whose HEAD moved."""
     if head(workspace) != original_head:
-        raise ArtifactError("HEAD moved during the run; automatic rollback refused")
+        raise RollbackError("HEAD moved during the run; automatic rollback refused")
     paths = changed_paths(workspace, before, after)
     for relative in paths:
-        destination = _safe_path(workspace, relative)
-        metadata = _git(workspace, "ls-tree", "-z", before, "--", relative)
-        if not metadata:
-            if destination.is_dir() and not destination.is_symlink():
-                raise ArtifactError(f"cannot remove changed directory {relative!r}")
-            destination.unlink(missing_ok=True)
-            parent = destination.parent
-            root_resolved = workspace.resolve()
-            while parent != root_resolved and parent.is_relative_to(root_resolved):
+        try:
+            destination = _safe_path(workspace, relative)
+            metadata = _git(workspace, "ls-tree", "-z", before, "--", relative)
+            if not metadata:
+                if destination.is_dir() and not destination.is_symlink():
+                    raise RollbackError(f"cannot remove changed directory {relative!r}")
+                destination.unlink(missing_ok=True)
+                parent = destination.parent
+                root_resolved = workspace.resolve()
+                while parent != root_resolved and parent.is_relative_to(root_resolved):
+                    try:
+                        parent.rmdir()
+                    except OSError as error:
+                        if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                            raise
+                        break
+                    parent = parent.parent
+                continue
+            header = metadata.split(b"\t", 1)[0].decode()
+            mode_text, kind, object_id = header.split(" ")
+            if kind != "blob":
+                raise RollbackError(f"cannot restore non-file Git entry {relative!r}")
+            content = _git(workspace, "cat-file", "blob", object_id)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                destination.unlink()
+            if mode_text == "120000":
+                destination.unlink(missing_ok=True)
+                destination.symlink_to(os.fsdecode(content))
+            else:
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix="sdd-restore-", dir=destination.parent
+                )
                 try:
-                    parent.rmdir()
-                except OSError:
-                    break
-                parent = parent.parent
-            continue
-        header = metadata.split(b"\t", 1)[0].decode()
-        mode_text, kind, object_id = header.split(" ")
-        if kind != "blob":
-            raise ArtifactError(f"cannot restore non-file Git entry {relative!r}")
-        content = _git(workspace, "cat-file", "blob", object_id)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink():
-            destination.unlink()
-        if mode_text == "120000":
-            destination.unlink(missing_ok=True)
-            destination.symlink_to(os.fsdecode(content))
-        else:
-            descriptor, temporary = tempfile.mkstemp(prefix="sdd-restore-", dir=destination.parent)
-            try:
-                with os.fdopen(descriptor, "wb") as output:
-                    output.write(content)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temporary, stat.S_IMODE(int(mode_text, 8)))
-                os.replace(temporary, destination)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
+                    with os.fdopen(descriptor, "wb") as output:
+                        output.write(content)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chmod(temporary, stat.S_IMODE(int(mode_text, 8)))
+                    os.replace(temporary, destination)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+        except OSError as error:
+            raise RollbackError(f"failed to restore {relative!r}: {error}", cause=error) from error

@@ -20,6 +20,11 @@ from sdd_engine.artifacts import (
     WorkspaceRegistry,
 )
 from sdd_engine.guidance import PromptHydrator
+from sdd_engine.limits import (
+    MAX_DIAGNOSTIC_CHARS,
+    MAX_GENERATED_ARTIFACT_BYTES,
+    MAX_ORIGINAL_FILE_BYTES,
+)
 from sdd_engine.models import (
     ArtifactRef,
     FailureReport,
@@ -47,9 +52,6 @@ CHECKPOINT_TYPES: tuple[type, ...] = (
     Target,
     Tier,
 )
-
-# Largest existing file the engine will overwrite; it must fit in the artifact store for rollback.
-MAX_ORIGINAL_FILE_BYTES = 16_000_000
 
 
 def checkpoint_serializer() -> JsonPlusSerializer:
@@ -166,7 +168,7 @@ def _build_specialist_subgraph(
         failure = FailureReport(
             category=category,
             summary=summary,
-            diagnostics="" if error is None else str(error)[:16_000],
+            diagnostics="" if error is None else str(error)[:MAX_DIAGNOSTIC_CHARS],
         )
         return dependencies.artifacts.put_model(failure)
 
@@ -301,7 +303,7 @@ def _build_specialist_subgraph(
 
         try:
             generated = dependencies.artifacts.get_model(
-                state.generated_artifact, GenerationOutput, 4_000_000
+                state.generated_artifact, GenerationOutput, MAX_GENERATED_ARTIFACT_BYTES
             )
             workspace = dependencies.workspaces.get(state.workspace_id)
         except ArtifactError as error:
@@ -442,4 +444,4 @@ def _format_report(report: ValidationReport) -> str:
             f"[{result.command_name}] exit_code={result.exit_code} timed_out={result.timed_out}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-    return "\n\n".join(sections)[:16_000]
+    return "\n\n".join(sections)[:MAX_DIAGNOSTIC_CHARS]

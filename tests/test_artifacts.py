@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,10 @@ from sdd_engine.artifacts import (
     WorkspaceBusyError,
     WorkspaceRegistry,
 )
+from sdd_engine.errors import ArtifactIntegrityError, EngineError, GitOperationError, RollbackError
 from sdd_engine.models import FailureReport
+from sdd_engine.scope import _safe_path, restore_tree, worktree_tree
+from sdd_engine.store import ProjectStore
 
 
 def test_store_round_trips_content_and_models(tmp_path: Path) -> None:
@@ -31,8 +35,24 @@ def test_store_rejects_tampered_content(tmp_path: Path) -> None:
     reference = store.put(b"original", "text/plain")
     (tmp_path / reference.digest[:2] / reference.digest[2:]).write_bytes(b"tampered")
 
-    with pytest.raises(ArtifactError, match="integrity"):
+    with pytest.raises(ArtifactIntegrityError, match="integrity"):
         store.get(reference, 1_000)
+
+
+def test_project_store_shares_model_and_integrity_behavior(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "engine.db")
+    report = FailureReport(category="c", summary="s")
+
+    reference = store.put_model(report)
+
+    assert store.get_model(reference, FailureReport, 10_000) == report
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE artifacts SET content = ? WHERE digest = ? AND media_type = ?",
+            (b"tampered", reference.digest, reference.media_type),
+        )
+    with pytest.raises(ArtifactIntegrityError, match="integrity"):
+        store.get_model(reference, FailureReport, 10_000)
 
 
 def test_store_enforces_hydration_limit(tmp_path: Path) -> None:
@@ -52,12 +72,93 @@ def test_workspace_writes_and_reads_inside_root(tmp_path: Path) -> None:
     assert registry.read_text("ws", "missing.py", 1_000) is None
 
 
-@pytest.mark.parametrize("path", ["../escape.py", "/abs.py", "a\\b.py"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../escape.py",
+        "/abs.py",
+        "a\\b.py",
+        ".GIT/hooks/pre-commit",
+        "src/x\x00.py",
+        "src/x\n.py",
+        "node_modules/.bin/tsc",
+        "build/CTestTestfile.cmake",
+    ],
+)
 def test_workspace_rejects_unsafe_paths(tmp_path: Path, path: str) -> None:
     registry = WorkspaceRegistry({"ws": tmp_path})
 
     with pytest.raises(ArtifactError):
         registry.write_text("ws", path, "x")
+
+
+@pytest.mark.parametrize("path", [".GIT/config", "src/x\x00.py", "src/x\n.py", "../x"])
+def test_scope_rejects_unsafe_tree_paths(tmp_path: Path, path: str) -> None:
+    with pytest.raises(ArtifactError):
+        _safe_path(tmp_path, path)
+
+
+def test_scope_can_resolve_validator_output_for_rollback(tmp_path: Path) -> None:
+    assert (
+        _safe_path(tmp_path, "build/CTestTestfile.cmake") == tmp_path / "build/CTestTestfile.cmake"
+    )
+
+
+def test_engine_error_envelope_and_retryability() -> None:
+    error = WorkspaceBusyError("workspace is busy")
+
+    assert isinstance(error, EngineError)
+    assert error.to_envelope() == {
+        "error": {"code": "workspace_busy", "message": "workspace is busy", "retryable": True}
+    }
+    assert GitOperationError("git failed").retryable is False
+
+
+def test_restore_tree_wraps_filesystem_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subprocess.run(("git", "init", "-q", str(tmp_path)), check=True, capture_output=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    original_head = subprocess.run(
+        ("git", "-C", str(tmp_path), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    before = worktree_tree(tmp_path)
+    blocked = tmp_path / "blocked.py"
+    blocked.write_text("new", encoding="utf-8")
+    after = worktree_tree(tmp_path)
+    original_unlink = Path.unlink
+
+    def deny_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == blocked:
+            raise PermissionError("read-only directory")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", deny_unlink)
+
+    with pytest.raises(RollbackError, match="failed to restore 'blocked.py'") as caught:
+        restore_tree(tmp_path, before, after, original_head)
+    assert isinstance(caught.value, ArtifactError)
+    assert isinstance(caught.value.cause, PermissionError)
+    assert isinstance(caught.value.__cause__, PermissionError)
 
 
 def test_workspace_rejects_symlink_escape(tmp_path: Path) -> None:

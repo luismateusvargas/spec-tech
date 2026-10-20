@@ -7,6 +7,7 @@ import hashlib
 import os
 import stat
 import tempfile
+from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,17 +16,20 @@ from typing import Protocol, TypeVar
 
 from pydantic import ValidationError
 
+from sdd_engine.errors import (
+    ArtifactError as ArtifactError,
+)
+from sdd_engine.errors import (
+    ArtifactIntegrityError,
+    WorkspaceLockError,
+)
+from sdd_engine.errors import (
+    WorkspaceBusyError as WorkspaceBusyError,
+)
 from sdd_engine.models import ArtifactRef, StrictModel
+from sdd_engine.paths import resolve_workspace_path
 
 ModelT = TypeVar("ModelT", bound=StrictModel)
-
-
-class ArtifactError(RuntimeError):
-    """Raised when an artifact is missing, corrupt, or violates storage limits."""
-
-
-class WorkspaceBusyError(ArtifactError):
-    """Raised when another run holds the workspace lock."""
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,49 @@ class ArtifactStore(Protocol):
         """Load and strictly validate a bounded JSON artifact."""
 
 
-class FileArtifactStore:
+def _verify_bytes(content: bytes, reference: ArtifactRef) -> bytes:
+    """Reject bytes that disagree with a content-addressed pointer."""
+    if (
+        len(content) != reference.byte_length
+        or hashlib.sha256(content).hexdigest() != reference.digest
+    ):
+        raise ArtifactIntegrityError(f"artifact integrity check failed for {reference.digest}")
+    return content
+
+
+class BaseArtifactStore(ABC):
+    """Shared model and text operations for content-addressed stores."""
+
+    @abstractmethod
+    def put(self, content: bytes, media_type: str) -> ArtifactRef:
+        """Persist bytes and return their content pointer."""
+
+    @abstractmethod
+    def get(self, reference: ArtifactRef, max_bytes: int) -> bytes:
+        """Load bounded bytes after verifying their content pointer."""
+
+    def put_model(self, model: StrictModel) -> ArtifactRef:
+        """Serialize a strict model into the content store."""
+        return self.put(model.model_dump_json().encode("utf-8"), "application/json")
+
+    def get_text(self, reference: ArtifactRef, max_bytes: int) -> str:
+        """Decode one verified UTF-8 text artifact."""
+        try:
+            return self.get(reference, max_bytes).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ArtifactError("artifact is not valid UTF-8 text") from error
+
+    def get_model(self, reference: ArtifactRef, model_type: type[ModelT], max_bytes: int) -> ModelT:
+        """Decode and strictly validate a JSON artifact as a Pydantic model."""
+        try:
+            return model_type.model_validate_json(self.get(reference, max_bytes))
+        except ValidationError as error:
+            raise ArtifactIntegrityError(
+                f"stored artifact does not match {model_type.__name__}"
+            ) from error
+
+
+class FileArtifactStore(BaseArtifactStore):
     """Filesystem-backed content store with atomic writes and digest checks."""
 
     def __init__(self, root: Path) -> None:
@@ -86,10 +132,6 @@ class FileArtifactStore:
                 Path(temporary_name).unlink(missing_ok=True)
         return ArtifactRef(digest=digest, byte_length=len(content), media_type=media_type)
 
-    def put_model(self, model: StrictModel) -> ArtifactRef:
-        """Serialize a strict model into the content store."""
-        return self.put(model.model_dump_json().encode("utf-8"), "application/json")
-
     def get(self, reference: ArtifactRef, max_bytes: int) -> bytes:
         """Read bytes only when length and digest match the supplied reference."""
         if reference.byte_length > max_bytes:
@@ -98,24 +140,7 @@ class FileArtifactStore:
             content = self._path_for(reference.digest).read_bytes()
         except OSError as error:
             raise ArtifactError(f"could not read artifact {reference.digest}") from error
-        actual_digest = hashlib.sha256(content).hexdigest()
-        if len(content) != reference.byte_length or actual_digest != reference.digest:
-            raise ArtifactError(f"artifact integrity check failed for {reference.digest}")
-        return content
-
-    def get_text(self, reference: ArtifactRef, max_bytes: int) -> str:
-        """Decode one verified UTF-8 text artifact."""
-        try:
-            return self.get(reference, max_bytes).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ArtifactError("artifact is not valid UTF-8 text") from error
-
-    def get_model(self, reference: ArtifactRef, model_type: type[ModelT], max_bytes: int) -> ModelT:
-        """Decode and strictly validate a JSON artifact as a Pydantic model."""
-        try:
-            return model_type.model_validate_json(self.get(reference, max_bytes))
-        except ValidationError as error:
-            raise ArtifactError(f"stored artifact does not match {model_type.__name__}") from error
+        return _verify_bytes(content, reference)
 
     def _path_for(self, digest: str) -> Path:
         """Resolve a validated digest to its immutable storage path."""
@@ -179,7 +204,7 @@ class WorkspaceRegistry:
                 self._lock_directory / f"{digest}.lock", os.O_RDWR | os.O_CREAT, 0o600
             )
         except OSError as error:
-            raise ArtifactError(
+            raise WorkspaceLockError(
                 f"could not open the lock for workspace {workspace_id!r}"
             ) from error
         try:
@@ -275,16 +300,4 @@ class WorkspaceRegistry:
 
     def _resolve_file(self, workspace_id: str, relative_path: str) -> Path:
         """Resolve a safe relative path and reject symlink escapes."""
-        root = self.get(workspace_id)
-        posix_path = PurePosixPath(relative_path)
-        if (
-            posix_path.is_absolute()
-            or ".." in posix_path.parts
-            or ".git" in posix_path.parts
-            or "\\" in relative_path
-        ):
-            raise ArtifactError("workspace file paths must be relative and cannot traverse parents")
-        path = root.joinpath(*posix_path.parts)
-        if not path.resolve(strict=False).is_relative_to(root):
-            raise ArtifactError("workspace path escaped its configured root")
-        return path
+        return resolve_workspace_path(self.get(workspace_id), relative_path)

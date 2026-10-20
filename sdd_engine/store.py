@@ -2,21 +2,63 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from sdd_engine.artifacts import ArtifactError
-from sdd_engine.models import ArtifactRef, StrictModel, Target
+from sdd_engine.artifacts import BaseArtifactStore, _verify_bytes
+from sdd_engine.errors import ArtifactError, ArtifactIntegrityError, ProfileError, RunNotFoundError
+from sdd_engine.models import (
+    ArtifactRef,
+    GraphInput,
+    GraphState,
+    RunPhase,
+    RunStatus,
+    Target,
+)
 from sdd_engine.validation import ValidationProfile
 
-ModelT = TypeVar("ModelT", bound=StrictModel)
+_JSON_OBJECT = TypeAdapter(dict[str, object])
+_SUBMITTED_PATHS = TypeAdapter(tuple[str, ...])
+
+
+@dataclass(frozen=True)
+class StoredProfile:
+    """A validated profile and its persisted version identity."""
+
+    target: Target
+    profile: ValidationProfile
+    revision: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """One typed run row from the shared project database."""
+
+    run_id: str
+    workspace: Path
+    model: str
+    request: GraphInput
+    head: str
+    start_tree: str
+    phase: RunPhase
+    profile_revision: int
+    profile_digest: str
+    spec_path: str | None
+    spec_blob: str | None
+    outcome: RunStatus | None
+    state: GraphState | None
+    prompt: dict[str, object] | None
+    submitted: tuple[str, ...]
+    scope_report: dict[str, object] | None
 
 
 def project_database(workspace: Path) -> Path:
@@ -46,7 +88,7 @@ def project_database(workspace: Path) -> Path:
     return database
 
 
-class ProjectStore:
+class ProjectStore(BaseArtifactStore):
     """Keep one project's profiles, runs, checkpoints, snapshots, and artifacts together."""
 
     def __init__(self, database: Path) -> None:
@@ -55,19 +97,13 @@ class ProjectStore:
         self.database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self.connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 2:
+            if version > 3:
                 raise ArtifactError(f"unsupported engine database schema version {version}")
-            if version == 2:
+            if version == 3:
                 return
-            if version == 1:
-                connection.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS runs_active_workspace "
-                    "ON runs(workspace) WHERE phase != 'finished'"
-                )
-                connection.execute("PRAGMA user_version=2")
-                return
-            connection.executescript(
-                """
+            if version == 0:
+                connection.executescript(
+                    """
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS profiles (
@@ -90,6 +126,10 @@ class ProjectStore:
                     head TEXT NOT NULL,
                     start_tree TEXT NOT NULL,
                     phase TEXT NOT NULL CHECK(phase IN ('pending', 'terminal', 'finished')),
+                    profile_revision INTEGER NOT NULL DEFAULT 1 CHECK(profile_revision > 0),
+                    profile_digest TEXT NOT NULL DEFAULT '',
+                    spec_path TEXT,
+                    spec_blob TEXT,
                     outcome TEXT,
                     state TEXT,
                     prompt TEXT,
@@ -111,12 +151,30 @@ class ProjectStore:
                     PRIMARY KEY(digest, media_type)
                 );
                 """
-            )
+                )
+            else:
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+                }
+                additions = {
+                    "profile_revision": (
+                        "ALTER TABLE runs ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 1"
+                    ),
+                    "profile_digest": (
+                        "ALTER TABLE runs ADD COLUMN profile_digest TEXT NOT NULL DEFAULT ''"
+                    ),
+                    "spec_path": "ALTER TABLE runs ADD COLUMN spec_path TEXT",
+                    "spec_blob": "ALTER TABLE runs ADD COLUMN spec_blob TEXT",
+                }
+                for name, statement in additions.items():
+                    if name not in columns:
+                        connection.execute(statement)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS runs_active_workspace "
                 "ON runs(workspace) WHERE phase != 'finished'"
             )
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -151,18 +209,24 @@ class ProjectStore:
 
     def get_profile(self, target: Target) -> ValidationProfile:
         """Load a configured validation profile for a target."""
+        return self.get_profile_record(target).profile
+
+    def get_profile_record(self, target: Target) -> StoredProfile:
+        """Load a profile with its revision and SHA-256 content identity."""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT body FROM profiles WHERE target = ?", (target.value,)
+                "SELECT body, revision FROM profiles WHERE target = ?", (target.value,)
             ).fetchone()
         if row is None:
-            raise ArtifactError(f"validation profile for {target.value} is not configured")
-        return ValidationProfile.model_validate_json(row["body"])
+            raise ProfileError(f"validation profile for {target.value} is not configured")
+        try:
+            profile = ValidationProfile.model_validate_json(row["body"])
+        except ValidationError as error:
+            raise ProfileError(f"validation profile for {target.value} is invalid") from error
+        return StoredProfile(target, profile, int(row["revision"]), profile.digest())
 
     def put(self, content: bytes, media_type: str) -> ArtifactRef:
         """Persist immutable bytes by SHA-256 digest."""
-        import hashlib
-
         digest = hashlib.sha256(content).hexdigest()
         with self.connect() as connection:
             connection.execute(
@@ -173,65 +237,90 @@ class ProjectStore:
 
     def get(self, reference: ArtifactRef, max_bytes: int) -> bytes:
         """Load bounded content after validating its pointer and digest."""
-        import hashlib
-
         if reference.byte_length > max_bytes:
             raise ArtifactError("artifact exceeds its hydration limit")
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT media_type, content FROM artifacts WHERE digest = ? AND media_type = ?",
+                "SELECT content FROM artifacts WHERE digest = ? AND media_type = ?",
                 (reference.digest, reference.media_type),
             ).fetchone()
         if row is None:
             raise ArtifactError("artifact does not exist")
         content = bytes(row["content"])
-        if (
-            len(content) != reference.byte_length
-            or row["media_type"] != reference.media_type
-            or hashlib.sha256(content).hexdigest() != reference.digest
-        ):
-            raise ArtifactError("artifact integrity check failed")
-        return content
-
-    def put_model(self, model: StrictModel) -> ArtifactRef:
-        """Store a validated model as JSON."""
-        return self.put(model.model_dump_json().encode("utf-8"), "application/json")
-
-    def get_text(self, reference: ArtifactRef, max_bytes: int) -> str:
-        """Return verified UTF-8 text."""
-        try:
-            return self.get(reference, max_bytes).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ArtifactError("artifact is not UTF-8") from error
-
-    def get_model(self, reference: ArtifactRef, model_type: type[ModelT], max_bytes: int) -> ModelT:
-        """Load a verified strict JSON model."""
-        try:
-            return model_type.model_validate_json(self.get(reference, max_bytes))
-        except ValidationError as error:
-            raise ArtifactError("artifact has an invalid model contract") from error
+        return _verify_bytes(content, reference)
 
     def insert_run(
-        self, run_id: str, workspace: Path, model: str, request: StrictModel, head: str, tree: str
+        self,
+        run_id: str,
+        workspace: Path,
+        model: str,
+        request: GraphInput,
+        head: str,
+        tree: str,
+        profile_revision: int,
+        profile_digest: str,
+        spec_path: str | None = None,
+        spec_blob: str | None = None,
     ) -> None:
         """Record the start of an immutable run identity."""
         try:
             with self.connect() as connection:
                 connection.execute(
-                    "INSERT INTO runs(run_id, workspace, model, request, head, start_tree, phase) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                    (run_id, str(workspace), model, request.model_dump_json(), head, tree),
+                    "INSERT INTO runs(run_id, workspace, model, request, head, start_tree, phase, "
+                    "profile_revision, profile_digest, spec_path, spec_blob) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        str(workspace),
+                        model,
+                        request.model_dump_json(),
+                        head,
+                        tree,
+                        RunPhase.PENDING.value,
+                        profile_revision,
+                        profile_digest,
+                        spec_path,
+                        spec_blob,
+                    ),
                 )
         except sqlite3.IntegrityError as error:
             raise ArtifactError("workspace already has an unfinished engine run") from error
 
-    def run(self, run_id: str) -> dict[str, object]:
-        """Return a run row, rejecting unknown identifiers."""
+    def run(self, run_id: str) -> RunRecord:
+        """Return a validated run record, rejecting unknown identifiers."""
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
-            raise ArtifactError(f"run {run_id!r} does not exist")
-        return dict(row)
+            raise RunNotFoundError(f"run {run_id!r} does not exist")
+        try:
+            return RunRecord(
+                run_id=str(row["run_id"]),
+                workspace=Path(str(row["workspace"])),
+                model=str(row["model"]),
+                request=GraphInput.model_validate_json(str(row["request"])),
+                head=str(row["head"]),
+                start_tree=str(row["start_tree"]),
+                phase=RunPhase(row["phase"]),
+                profile_revision=int(row["profile_revision"]),
+                profile_digest=str(row["profile_digest"]),
+                spec_path=None if row["spec_path"] is None else str(row["spec_path"]),
+                spec_blob=None if row["spec_blob"] is None else str(row["spec_blob"]),
+                outcome=None if row["outcome"] is None else RunStatus(row["outcome"]),
+                state=(
+                    None
+                    if row["state"] is None
+                    else GraphState.model_validate_json(str(row["state"]))
+                ),
+                prompt=None if row["prompt"] is None else _JSON_OBJECT.validate_json(row["prompt"]),
+                submitted=_SUBMITTED_PATHS.validate_json(row["submitted"]),
+                scope_report=(
+                    None
+                    if row["scope_report"] is None
+                    else _JSON_OBJECT.validate_json(row["scope_report"])
+                ),
+            )
+        except (ValidationError, ValueError, TypeError) as error:
+            raise ArtifactIntegrityError(f"stored run {run_id!r} has an invalid record") from error
 
     def update_run(self, run_id: str, **values: str | None) -> None:
         """Persist a whitelisted run state update."""

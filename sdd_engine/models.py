@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from pathlib import PurePosixPath
 from typing import Annotated, TypeVar
 
 from pydantic import (
@@ -14,6 +13,20 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from sdd_engine.limits import (
+    MAX_CATEGORY_CHARS,
+    MAX_COMMAND_NAME_CHARS,
+    MAX_CONTEXT_REFS,
+    MAX_DIAGNOSTIC_CHARS,
+    MAX_PATH_CHARS,
+    MAX_SUMMARY_CHARS,
+    MAX_TARGET_FILES,
+)
+from sdd_engine.limits import (
+    MAX_FAILURE_REPORT_BYTES as MAX_FAILURE_REPORT_BYTES,
+)
+from sdd_engine.paths import canonical_relative_path
 
 ItemT = TypeVar("ItemT")
 
@@ -71,30 +84,33 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
+class RunPhase(StrEnum):
+    """Persistence phase of a run awaiting input, completion, or finalization."""
+
+    PENDING = "pending"
+    TERMINAL = "terminal"
+    FINISHED = "finished"
+
+
 TargetValue = Annotated[Target, Field(strict=False)]
 TierValue = Annotated[Tier, Field(strict=False)]
 StatusValue = Annotated[RunStatus, Field(strict=False)]
 
 
 def _require_safe_relative_path(value: str) -> str:
-    """Reject absolute paths, parent traversal, backslashes, and paths naming no file."""
-    path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "\\" in value or ".git" in path.parts:
-        raise ValueError("path must be a safe relative POSIX path")
-    if not path.parts:
-        raise ValueError("path must identify a file")
-    return value
+    """Canonicalize an approved workspace-relative path."""
+    return canonical_relative_path(value)
 
 
 def _require_unique_paths(value: tuple[str, ...]) -> tuple[str, ...]:
     """Bound a path list and reject duplicates."""
-    if not value or len(value) > 128 or len(set(value)) != len(value):
-        raise ValueError("must contain 1 to 128 unique paths")
+    if not value or len(value) > MAX_TARGET_FILES or len(set(value)) != len(value):
+        raise ValueError(f"must contain 1 to {MAX_TARGET_FILES} unique paths")
     return value
 
 
 SafeRelativePath = Annotated[
-    str, Field(min_length=1, max_length=512), AfterValidator(_require_safe_relative_path)
+    str, Field(min_length=1, max_length=MAX_PATH_CHARS), AfterValidator(_require_safe_relative_path)
 ]
 # Approved workspace-relative paths a run may write.
 TargetFiles = Annotated[JsonTuple[SafeRelativePath], AfterValidator(_require_unique_paths)]
@@ -119,12 +135,12 @@ class ErrorHandlingMapping(StrictModel):
 class OriginalFile(StrictModel):
     """A workspace file as it was before the run first wrote it, for rollback on failure."""
 
-    path: Annotated[str, Field(min_length=1, max_length=512)]
+    path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)]
     # None when the file did not exist; rollback then deletes it.
     content: ArtifactRef | None
     mode: Annotated[int, Field(ge=0, le=0o7777)] | None
     # The highest directory the write created, removed on rollback if it is empty again.
-    created_directory: Annotated[str, Field(min_length=1, max_length=512)] | None
+    created_directory: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)] | None
 
 
 class GraphInput(StrictModel):
@@ -143,8 +159,8 @@ class GraphInput(StrictModel):
     @classmethod
     def limit_context_references(cls, value: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
         """Bound the number of hydrated artifacts a run can request."""
-        if len(value) > 64:
-            raise ValueError("context may contain at most 64 artifact references")
+        if len(value) > MAX_CONTEXT_REFS:
+            raise ValueError(f"context may contain at most {MAX_CONTEXT_REFS} artifact references")
         return value
 
 
@@ -243,23 +259,18 @@ class GenerationPrompt(StrictModel):
 class FailureReport(StrictModel):
     """Bounded diagnostic payload stored externally and referenced from state."""
 
-    category: Annotated[str, Field(min_length=1, max_length=96)]
-    summary: Annotated[str, Field(min_length=1, max_length=2000)]
-    diagnostics: Annotated[str, Field(max_length=16000)] = ""
-
-
-# Worst case for a serialized FailureReport: every character of its 18,096 bounded characters
-# escaped as a six-byte JSON \uXXXX sequence, plus field names.
-MAX_FAILURE_REPORT_BYTES = 6 * (96 + 2000 + 16000) + 256
+    category: Annotated[str, Field(min_length=1, max_length=MAX_CATEGORY_CHARS)]
+    summary: Annotated[str, Field(min_length=1, max_length=MAX_SUMMARY_CHARS)]
+    diagnostics: Annotated[str, Field(max_length=MAX_DIAGNOSTIC_CHARS)] = ""
 
 
 class CommandResult(StrictModel):
     """Result of one allowlisted native compiler or static-analysis command."""
 
-    command_name: Annotated[str, Field(min_length=1, max_length=128)]
+    command_name: Annotated[str, Field(min_length=1, max_length=MAX_COMMAND_NAME_CHARS)]
     exit_code: int
-    stdout: Annotated[str, Field(max_length=16000)] = ""
-    stderr: Annotated[str, Field(max_length=16000)] = ""
+    stdout: Annotated[str, Field(max_length=MAX_DIAGNOSTIC_CHARS)] = ""
+    stderr: Annotated[str, Field(max_length=MAX_DIAGNOSTIC_CHARS)] = ""
     timed_out: bool = False
 
 
@@ -269,7 +280,9 @@ class ValidationReport(StrictModel):
     target: TargetValue
     passed: bool
     commands: JsonTuple[CommandResult]
-    summary: Annotated[str, Field(min_length=1, max_length=2000)]
+    summary: Annotated[str, Field(min_length=1, max_length=MAX_SUMMARY_CHARS)]
+    profile_revision: Annotated[int, Field(ge=1)] | None = None
+    profile_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
 
     @model_validator(mode="after")
     def require_all_commands_pass(self) -> ValidationReport:
