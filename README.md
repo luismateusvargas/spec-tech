@@ -25,8 +25,6 @@
 | [`toolchains/`](toolchains/README.md) | Digest-pinned Dockerfiles (`python.Dockerfile`, `rust.Dockerfile`, `go.Dockerfile`) for offline container validation |
 | [`tests/`](tests/) | Unit and real-container integration tests for contracts, artifacts, graph lifecycle, CLI, and Docker sandboxing |
 
-The older [`skills/sdd-implement/`](skills/sdd-implement/SKILL.md) and top-level `templates/` remain in the tree as deprecated legacy material for existing users. New work uses the twelve tiered SDD skills and `skills/sdd-shared/`.
-
 ---
 
 ## Skills catalog
