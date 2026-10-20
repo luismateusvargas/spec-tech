@@ -2,6 +2,7 @@
 
 Status: draft | ready | blocked
 Constitution: <relative path, if present>
+Target files: <comma-separated relative paths>
 
 ## Outcome
 

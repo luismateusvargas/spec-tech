@@ -5,6 +5,7 @@ Project: <relative path to project YAML>
 Constitution: <relative path>
 Related domains: <relative paths to domain YAML>
 Related designs: <relative paths>
+Target files: <comma-separated relative paths>
 
 ## Player outcome and non-goals
 

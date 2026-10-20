@@ -1,0 +1,20 @@
+"""Shared bounds for engine contracts and artifact hydration."""
+
+MAX_PATH_CHARS = 512
+MAX_TARGET_FILES = 128
+MAX_CONTEXT_REFS = 64
+MAX_COMMAND_NAME_CHARS = 128
+MAX_DIAGNOSTIC_CHARS = 16_000
+MAX_SUMMARY_CHARS = 2_000
+MAX_CATEGORY_CHARS = 96
+# JSON can escape each bounded character as a six-byte Unicode sequence.
+MAX_FAILURE_REPORT_BYTES = 6 * (MAX_CATEGORY_CHARS + MAX_SUMMARY_CHARS + MAX_DIAGNOSTIC_CHARS) + 256
+MAX_FILE_CHARS = 1_000_000
+MAX_SUBMISSION_BYTES = 3_000_000
+MAX_GENERATED_ARTIFACT_BYTES = 4_000_000
+MAX_CONTEXT_BYTES = 2_000_000
+# JSON escaping can expand each hydrated character up to six bytes, plus prompt metadata.
+MAX_PROMPT_ARTIFACT_BYTES = 6 * MAX_CONTEXT_BYTES + 100_000
+MAX_REPORT_BYTES = 1_000_000
+# Existing files must fit in the artifact store before they are overwritten for rollback.
+MAX_ORIGINAL_FILE_BYTES = 16_000_000
