@@ -1,2 +1,10 @@
 # Temporary benchmark checkouts; not part of the distributable package.
 .reference-repos/
+
+# Python tooling and build output.
+__pycache__/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
